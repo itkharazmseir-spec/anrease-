@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022-x86",
+      "displayName": "Visual Studio 2022 - Win32 (client)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/build/vs2022-x86",
+      "cacheVariables": {
+        "AO_BUILD_CLIENT": "ON",
+        "AO_BUILD_SERVER": "OFF"
+      }
+    },
+    {
+      "name": "server",
+      "displayName": "Dedicated server (native, Windows x64 or Linux)",
+      "binaryDir": "${sourceDir}/build/server",
+      "cacheVariables": {
+        "AO_BUILD_CLIENT": "OFF",
+        "AO_BUILD_SERVER": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "client-release", "configurePreset": "vs2022-x86", "configuration": "Release" },
+    { "name": "client-debug",   "configurePreset": "vs2022-x86", "configuration": "Debug" },
+    { "name": "server-release", "configurePreset": "server",     "configuration": "Release" }
+  ]
+}

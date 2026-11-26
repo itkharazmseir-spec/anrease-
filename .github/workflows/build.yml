@@ -1,0 +1,114 @@
+﻿name: Build AndreasOnline client
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build-client:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Clone plugin-sdk (DK22Pac/plugin-sdk)
+        shell: pwsh
+        run: |
+          $parent = Split-Path $env:GITHUB_WORKSPACE -Parent
+          $sdkDir = Join-Path $parent "plugin-sdk"
+          git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git "$sdkDir"
+          echo "PLUGIN_SDK_DIR=$sdkDir" >> $env:GITHUB_ENV
+
+      - name: Generate plugin-sdk solution (premake)
+        shell: pwsh
+        working-directory: ${{ env.PLUGIN_SDK_DIR }}\tools\premake
+        run: |
+          .\premake5.exe --pluginsdkdir="$env:PLUGIN_SDK_DIR" vs2022
+          if ($LASTEXITCODE -ne 0) { throw "premake5 failed with exit code $LASTEXITCODE" }
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Plugin_SA (Release + zDebug, auto-detect platform)
+        shell: pwsh
+        run: |
+          $slnPath = Join-Path $env:PLUGIN_SDK_DIR "plugin.sln"
+          $content = Get-Content $slnPath -Raw
+          if (-not ($content -match "(?s)GlobalSection\(SolutionConfigurationPlatforms\) = preSolution(.*?)EndGlobalSection")) {
+              throw "Could not find SolutionConfigurationPlatforms in plugin.sln"
+          }
+          $lines = $Matches[1] -split "`r?`n" | Where-Object { $_.Trim() -ne "" }
+          $releaseLine = $lines | Where-Object { $_ -match "^\s*Release\|" } | Select-Object -First 1
+          $debugLine   = $lines | Where-Object { $_ -match "^\s*zDebug\|" }  | Select-Object -First 1
+          if (-not $releaseLine) { throw "No Release|* solution configuration found. Raw section:`n$($Matches[1])" }
+          if (-not $debugLine)   { throw "No zDebug|* solution configuration found. Raw section:`n$($Matches[1])" }
+
+          $releasePlat = ($releaseLine -split "\|")[1].Split("=")[0].Trim()
+          $debugPlat   = ($debugLine -split "\|")[1].Split("=")[0].Trim()
+
+          Write-Host "Using Release platform: '$releasePlat'"
+          Write-Host "Using zDebug platform:  '$debugPlat'"
+
+          msbuild "$slnPath" /t:Plugin_SA /p:Configuration=Release /p:Platform="$releasePlat" /m
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed" }
+
+          msbuild "$slnPath" /t:Plugin_SA /p:Configuration=zDebug /p:Platform="$debugPlat" /m
+          if ($LASTEXITCODE -ne 0) { throw "zDebug build failed" }
+
+      - name: Verify Plugin.lib was produced
+        shell: pwsh
+        run: |
+          $lib = Join-Path $env:PLUGIN_SDK_DIR "output\lib\Plugin.lib"
+          if (-not (Test-Path $lib)) { throw "Plugin.lib not found at $lib" }
+          Write-Host "Found $lib"
+
+      - name: Configure AndreasOnline client (CMake + VS generator)
+        shell: cmd
+        run: cmake --preset vs2022-x86
+
+      - name: Build AndreasOnline client (Release)
+        shell: cmd
+        run: cmake --build --preset client-release
+
+      - name: Find built .asi
+        id: find
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem -Path . -Recurse -Filter AndreasOnline.asi | Select-Object -First 1
+          if (-not $f) { throw "AndreasOnline.asi not found in build output" }
+          echo "path=$($f.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndreasOnline-asi
+          path: ${{ steps.find.outputs.path }}
+
+  build-server:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Configure server (CMake)
+        shell: cmd
+        run: cmake --preset server
+
+      - name: Build server (Release)
+        shell: cmd
+        run: cmake --build --preset server-release
+
+      - name: Find built server exe
+        id: find
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem -Path . -Recurse -Filter AndreasOnlineServer.exe | Select-Object -First 1
+          if (-not $f) { throw "AndreasOnlineServer.exe not found in build output" }
+          echo "path=$($f.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndreasOnlineServer-exe
+          path: ${{ steps.find.outputs.path }}
