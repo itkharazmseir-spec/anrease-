@@ -5,7 +5,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "ao/Protocol.h"
 
@@ -41,6 +46,18 @@ public:
     void SendPlayerState(const proto::PlayerState& state);
     void SendChatMessage(const std::string& text);
 
+    // Thread-safe snapshot of who the server has told us is online (built
+    // from PlayerJoined/PlayerLeft), id -> name. Cheap to call every tick -
+    // the overlay (step: in-game HUD, see Overlay.h) uses this instead of
+    // real CPeds, since we don't yet have a verified address to spawn one
+    // on this build (see docs on CPopulation::AddPed).
+    std::vector<std::pair<uint32_t, std::string>> GetPlayers() const;
+
+    // Fired (from whichever thread calls Poll(), i.e. the polling thread)
+    // whenever a ChatMessage arrives, including the echo of our own sent
+    // messages (the server broadcasts to everyone, sender included).
+    void SetChatCallback(std::function<void(uint32_t playerId, const std::string& text)> cb);
+
 private:
     void HandleConnect();
     void HandleDisconnect();
@@ -53,6 +70,11 @@ private:
     bool       m_handshakeAccepted = false;
     uint32_t   m_localPlayerId = 0;
     std::string m_pendingPlayerName;
+
+    mutable std::mutex m_playersMutex;
+    std::map<uint32_t, std::string> m_players; // guarded by m_playersMutex
+
+    std::function<void(uint32_t, const std::string&)> m_chatCallback;
 };
 
 } // namespace ao

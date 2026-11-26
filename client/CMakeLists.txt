@@ -15,11 +15,13 @@ add_library(ao_client SHARED
     src/NetworkConfig.h
     src/NetworkClient.cpp
     include/ao/NetworkClient.h
+    src/Overlay.cpp
+    include/ao/Overlay.h
 )
 
 target_include_directories(ao_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-target_link_libraries(ao_client PRIVATE PluginSDK::SA ao_shared enet)
+target_link_libraries(ao_client PRIVATE PluginSDK::SA ao_shared enet user32 gdi32)
 
 target_compile_definitions(ao_client PRIVATE
     TARGET_NAME="AndreasOnline"

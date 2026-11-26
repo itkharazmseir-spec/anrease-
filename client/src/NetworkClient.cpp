@@ -97,6 +97,9 @@ void NetworkClient::Disconnect() {
     m_connected = false;
     m_handshakeAccepted = false;
     m_localPlayerId = 0;
+
+    std::lock_guard<std::mutex> lock(m_playersMutex);
+    m_players.clear();
 }
 
 void NetworkClient::HandleConnect() {
@@ -141,6 +144,10 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                 m_handshakeAccepted = true;
                 m_localPlayerId = ack.assignedPlayerId;
                 log::Info("NetworkClient: handshake accepted, player id = %u", m_localPlayerId);
+                {
+                    std::lock_guard<std::mutex> lock(m_playersMutex);
+                    m_players[m_localPlayerId] = m_pendingPlayerName + " (you)";
+                }
             } else {
                 const char* reason =
                     ack.result == proto::HandshakeResult::ProtocolMismatch ? "protocol mismatch" :
@@ -155,8 +162,12 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             proto::PlayerJoined joined{};
             std::memcpy(&joined, body, sizeof(joined));
             if (joined.playerId == m_localPlayerId) break; // that's us
-            log::Info("NetworkClient: player %u ('%s') joined", joined.playerId,
-                      ClampedName(joined.playerName, proto::kMaxNameLen).c_str());
+            {
+                const std::string name = ClampedName(joined.playerName, proto::kMaxNameLen);
+                log::Info("NetworkClient: player %u ('%s') joined", joined.playerId, name.c_str());
+                std::lock_guard<std::mutex> lock(m_playersMutex);
+                m_players[joined.playerId] = name;
+            }
             break;
         }
         case proto::MessageType::PlayerLeft: {
@@ -164,6 +175,10 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             proto::PlayerLeft left{};
             std::memcpy(&left, body, sizeof(left));
             log::Info("NetworkClient: player %u left", left.playerId);
+            {
+                std::lock_guard<std::mutex> lock(m_playersMutex);
+                m_players.erase(left.playerId);
+            }
             break;
         }
         case proto::MessageType::PlayerState: {
@@ -181,8 +196,9 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             if (bodyLen != sizeof(proto::ChatMessage)) return;
             proto::ChatMessage msg{};
             std::memcpy(&msg, body, sizeof(msg));
-            log::Info("NetworkClient: chat from %u: %s", msg.playerId,
-                      ClampedName(msg.text, proto::kMaxChatLen).c_str());
+            const std::string text = ClampedName(msg.text, proto::kMaxChatLen);
+            log::Info("NetworkClient: chat from %u: %s", msg.playerId, text.c_str());
+            if (m_chatCallback) m_chatCallback(msg.playerId, text);
             break;
         }
         default:
@@ -225,6 +241,18 @@ void NetworkClient::SendPlayerState(const proto::PlayerState& stateIn) {
 
     ENetPacket* packet = enet_packet_create(buf, sizeof(buf), ENET_PACKET_FLAG_UNSEQUENCED);
     enet_peer_send(reinterpret_cast<ENetPeer*>(m_peer), kChannelUnreliable, packet);
+}
+
+std::vector<std::pair<uint32_t, std::string>> NetworkClient::GetPlayers() const {
+    std::lock_guard<std::mutex> lock(m_playersMutex);
+    return std::vector<std::pair<uint32_t, std::string>>(m_players.begin(), m_players.end());
+}
+
+void NetworkClient::SetChatCallback(std::function<void(uint32_t, const std::string&)> cb) {
+    // Only ever set once from Main.cpp before the polling thread starts, and
+    // only ever invoked from that same polling thread (inside Poll()) - no
+    // lock needed for the std::function itself.
+    m_chatCallback = std::move(cb);
 }
 
 void NetworkClient::SendChatMessage(const std::string& text) {

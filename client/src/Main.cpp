@@ -47,17 +47,26 @@
 // tracking and the local log are never affected by the network state.
 // Remote players' PlayerState updates are only logged for now (see
 // NetworkClient::HandlePacket) - actually spawning/moving a CPed for them
-// is step 3.
+// is step 3, and is blocked on finding CPopulation::AddPed's real address
+// for this build (the RGL exe turned out to be ~3x the size of 1.0 US with
+// this whole code region restructured - see ao/GameAddrs.h notes once that
+// search resumes). Until then, remote players are made visible a different
+// way that needs ZERO new game addresses: a standalone Win32 overlay window
+// (ao::Overlay) showing connection status, the player roster, and chat -
+// drawn entirely outside the game's own renderer, so it works regardless of
+// whether a drawingEvent/AddPed address is ever found. See Overlay.h.
 
 #include "plugin.h"
 
 #include "ao/Version.h"
 #include "ao/GameAddrs.h"
 #include "ao/NetworkClient.h"
+#include "ao/Overlay.h"
 #include "LocalPlayer.h"
 #include "Log.h"
 #include "NetworkConfig.h"
 
+#include <cstdio>
 #include <string>
 #include <windows.h>
 
@@ -67,14 +76,17 @@ namespace {
 
 ao::LocalPlayer   g_localPlayer;
 ao::NetworkClient g_network;
+ao::Overlay       g_overlay;
 
 constexpr DWORD kPollIntervalMs    = 50;    // local player snapshot refresh rate
 constexpr DWORD kLogIntervalMs     = 5000;  // unchanged from the original design
 constexpr DWORD kNetSendIntervalMs = 100;   // ~10 Hz PlayerState updates to the server
+constexpr DWORD kOverlaySyncMs     = 250;   // player-list/status refresh rate for the HUD
 
 DWORD WINAPI PollThreadProc(LPVOID) {
     DWORD msSinceLastLog = 0;
     DWORD msSinceLastSend = 0;
+    DWORD msSinceOverlaySync = 0;
 
     for (;;) {
         g_localPlayer.Update();
@@ -103,9 +115,27 @@ DWORD WINAPI PollThreadProc(LPVOID) {
                           s.inVehicle ? s.vehicleModel : -1);
         }
 
+        if (msSinceOverlaySync >= kOverlaySyncMs) {
+            msSinceOverlaySync = 0;
+
+            char statusBuf[160];
+            if (g_network.IsReady()) {
+                std::snprintf(statusBuf, sizeof(statusBuf),
+                              "AndreasOnline - connected (id %u)", g_network.LocalPlayerId());
+            } else if (g_network.IsConnected()) {
+                std::snprintf(statusBuf, sizeof(statusBuf), "AndreasOnline - connecting...");
+            } else {
+                std::snprintf(statusBuf, sizeof(statusBuf),
+                              "AndreasOnline - no server (see AndreasOnline.cfg)");
+            }
+            g_overlay.SetStatus(statusBuf);
+            g_overlay.SetPlayers(g_network.GetPlayers());
+        }
+
         Sleep(kPollIntervalMs);
         msSinceLastLog += kPollIntervalMs;
         msSinceLastSend += kPollIntervalMs;
+        msSinceOverlaySync += kPollIntervalMs;
     }
     return 0;
 }
@@ -131,6 +161,21 @@ public:
                            "before re-enabling.");
             return;
         }
+
+        // Wire the overlay's chat input up to the network layer, and route
+        // every incoming ChatMessage (including the echo of our own sent
+        // lines - the server broadcasts to everyone, sender included) back
+        // to the overlay's chat log. Both callbacks must be set before
+        // Start()/the polling thread begins.
+        g_overlay.SetSendCallback([](const std::string& text) {
+            g_network.SendChatMessage(text);
+        });
+        g_network.SetChatCallback([](uint32_t playerId, const std::string& text) {
+            char line[200];
+            std::snprintf(line, sizeof(line), "[%u] %s", playerId, text.c_str());
+            g_overlay.AddChatLine(line);
+        });
+        g_overlay.Start();
 
         const std::string cfgPath = paths::GetPluginDirRelativePathA("AndreasOnline.cfg");
         const ao::NetworkConfig netCfg = ao::LoadNetworkConfig(cfgPath);
