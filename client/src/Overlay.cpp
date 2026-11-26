@@ -83,7 +83,10 @@ DWORD WINAPI OverlayThreadProc(LPVOID param) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    // IDC_ARROW expands to an ANSI (LPSTR) resource id when UNICODE isn't
+    // defined project-wide, which doesn't match LoadCursorW's LPCWSTR param -
+    // cast explicitly rather than relying on the project defining UNICODE.
+    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
     wc.lpszClassName = kWndClassName;
     RegisterClassExW(&wc); // ignore failure: AlreadyExists if we race another instance
 
