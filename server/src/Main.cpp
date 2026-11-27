@@ -117,6 +117,9 @@ struct ConnectedPlayer {
     ao::proto::PlayerState lastState{};
     uint32_t              lastChatMs = 0; // enet_time_get() at last accepted
                                            // ChatMessage, for anti-spam
+    uint32_t              lastPosLogMs = 0; // enet_time_get() at last position
+                                             // log line, for throttling (see
+                                             // kPosLogIntervalMs)
 };
 
 constexpr enet_uint8 kChannelReliable   = 0;
@@ -127,6 +130,17 @@ constexpr enet_uint8 kChannelCount      = 2;
 // anything faster is silently dropped (not queued/delayed) rather than
 // disconnecting the spammer.
 constexpr uint32_t kMinChatIntervalMs = 400;
+
+// Position log (2026-11-27): PlayerState arrives ~10 times/sec per player
+// (see client/src/Main.cpp's kNetSendIntervalMs), so logging every one would
+// flood the server console/log file. Throttled to once per this many
+// milliseconds per player instead - frequent enough to find where someone
+// actually is within a few seconds of asking, not so frequent it drowns out
+// the join/leave/chat/damage lines this server already logs. This exists
+// purely as an operator-facing convenience (e.g. to find real coordinates to
+// hand to the standalone FakePlayer.exe test tool) - it changes no protocol
+// behaviour and is not read back by any client.
+constexpr uint32_t kPosLogIntervalMs = 5000;
 
 uint32_t g_nextPlayerId = 1;
 uint32_t g_maxPlayers   = 32; // overridable via argv[2]; also used as the
@@ -252,6 +266,14 @@ void HandlePlayerState(ENetHost* host, ENetPeer* peer, const uint8_t* data, size
         return;
     }
     it->second.lastState = state;
+
+    const uint32_t now = enet_time_get();
+    if (it->second.lastPosLogMs == 0 || (now - it->second.lastPosLogMs) >= kPosLogIntervalMs) {
+        it->second.lastPosLogMs = now;
+        LogLine("player %u ('%s') pos %.3f %.3f %.3f  heading %.3f rad  veh %d",
+                id, it->second.name.c_str(), state.x, state.y, state.z,
+                state.headingRad, state.vehicleModel);
+    }
 
     BroadcastMessage(host, ao::proto::MessageType::PlayerState, state, /*reliable=*/false);
 }
