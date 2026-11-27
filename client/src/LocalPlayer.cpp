@@ -196,6 +196,19 @@ bool LocalPlayer::GiveWeapon(eWeaponType weaponType, uint32_t ammo) {
         w.m_nAmmoInClip = ammo;
         w.m_nAmmoTotal = ammo;
         w.m_nTimeForNextShot = 0;
+
+        // 2026-11-27, found during the first real in-game test of this
+        // feature: writing the weapon into m_aWeapons[slot] alone does NOT
+        // make the game hold/show it - CPed::m_nSelectedWepSlot (plugin-sdk
+        // VALIDATE_OFFSET(CPed, m_nSelectedWepSlot, 0x718)) is a separate
+        // field that says which slot is *currently equipped*, and nothing
+        // above touches it. Without this, a given weapon sits correctly in
+        // the inventory array but the player keeps visibly holding whatever
+        // they already had out, with no indication anything happened unless
+        // they manually scroll/TAB to the new weapon. Switching to the new
+        // slot here is what a store purchase (or /giveweapon) should
+        // reasonably do - immediately equip what was just given.
+        ped->m_nSelectedWepSlot = static_cast<unsigned char>(slot);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

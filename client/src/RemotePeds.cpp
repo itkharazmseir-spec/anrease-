@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "MainThreadGuard.h"
 
+#include <cmath>
 #include <utility>
 #include <windows.h>
 
@@ -262,7 +263,24 @@ CVehicle* RemotePedManager::SpawnVehicle(const proto::PlayerState& state) {
 }
 
 bool RemotePedManager::SpawnStandaloneVehicle(int32_t modelId, float x, float y, float z) {
-    CVehicle* veh = TryCreateCarForScript_RGL(modelId, CVector(x, y, z), /*doMissionCleanup=*/0);
+    // 2026-11-27, found during the first real in-game test of the store:
+    // several vehicle purchases made back-to-back (while standing still)
+    // all spawned at the exact same point and piled on top of each other -
+    // easy to mistake for "nothing happened" since they're indistinguishable
+    // at a glance and the game's own collision response can shove them off
+    // in unpredictable directions. Spreading repeated calls around a small
+    // circle keeps each one visible and separable. This is purely cosmetic
+    // spacing, not game-state - resets to the same sequence each time the
+    // plugin (re)loads, which is fine for what it's for.
+    static int s_spawnIndex = 0;
+    const int index = s_spawnIndex++;
+    constexpr float kSpawnRadius = 4.0f;
+    const float angle = static_cast<float>(index) * 2.39996323f; // golden-angle spacing
+    const float offsetX = kSpawnRadius * std::cos(angle);
+    const float offsetY = kSpawnRadius * std::sin(angle);
+
+    CVehicle* veh = TryCreateCarForScript_RGL(modelId, CVector(x + offsetX, y + offsetY, z),
+                                               /*doMissionCleanup=*/0);
     if (!veh) {
         log::Error("RemotePedManager: SpawnStandaloneVehicle failed (model %d at "
                    "%.3f %.3f %.3f) - fingerprint mismatch, invalid model, or the "
@@ -271,7 +289,7 @@ bool RemotePedManager::SpawnStandaloneVehicle(int32_t modelId, float x, float y,
         return false;
     }
     log::Info("RemotePedManager: spawned standalone vehicle (model %d) at %.3f %.3f %.3f",
-              modelId, x, y, z);
+              modelId, x + offsetX, y + offsetY, z);
     return true;
 }
 
