@@ -724,3 +724,101 @@ crashes, the likely next step is a live debugger attached to a reproduction
 to directly observe which thread is actually racing with
 `AddPed`/`CreateCarForScript`, since guessing a third time without that
 data would not be well-grounded.**
+
+## 2026-11-27 (later still) - v2 confirmed working for ped spawn, but vehicle spawn deadlocks the whole game - AllThreadsSuspendGuard removed from SpawnVehicle
+
+**Positive result first:** the user rebuilt/redeployed the v2 `.asi`
+(`AllThreadsSuspendGuard`, previous section) and ran `FakePlayer.exe`
+against a real running copy of the game. The on-foot ped-spawn path
+(`AddPed_RGL`, wrapped in `AllThreadsSuspendGuard`) now joined, spawned,
+walked, and switched pedModel (CJ/CSPLAY) repeatedly with **no crash** -
+this is real evidence v2 actually closed the original ped-spawn race, at
+least for this test.
+
+**New finding - vehicle spawn deadlocks:** `FakePlayer.exe` was upgraded
+this round into an automatic multi-phase test tool (see its own top-of-file
+comment) that, given one start position, cycles through on-foot CJ ->
+on-foot CSPLAY -> in vehicle (Landstalker, model 400) -> exiting vehicle ->
+repeat, plus periodic automatic damage-sync tests - specifically so the
+previously-untested vehicle-spawn path (`CreateCarForScript_RGL`) would
+finally get exercised. The very first time phase 3 ("IN VEHICLE") ran
+(`SpawnVehicle()` -> `AllThreadsSuspendGuard` + `TryCreateCarForScript_RGL`
+with `state.vehicleModel = 400`), the real game **hung completely and had
+to be force-closed** - confirmed by the user ("بازی هنگ کرد و کلا خارج شد
+از بازی"). The server's own position log (item 10's periodic logging,
+previous section) shows the real player's position freezing dead solid for
+over a minute right around the moment `veh 400` first appears in
+FakePlayer's own state log, then nothing further from that player at all -
+consistent with the whole process having frozen, not just the one spawn
+call failing cleanly.
+
+**Root cause (reasoned, not yet directly observed via debugger):**
+`CreateCarForScript` almost certainly needs to pump `CStreaming` - the
+game's background model/collision loader thread - to finish bringing a
+vehicle's resources fully in before the function can return, the same way
+streaming in any other game asset works. `AllThreadsSuspendGuard` suspends
+*every* other thread in the process for the full duration of the call,
+including that streaming thread. If `CreateCarForScript_RGL` ever needs
+that thread to run (post a completion, service a callback, etc.) before it
+can finish, suspending it first guarantees the call can never return - a
+deterministic deadlock, not the rare "mid-allocation" hang disclosed for
+peds. Pedestrian spawn never showed this because `AddPed_RGL`'s models
+(CJ/CSPLAY) are, by this project's own design (see the comment above
+`kRemotePedModel`/`ResolveRemotePedModel` in `RemotePeds.cpp`), guaranteed
+already resident from the moment the game boots - so `AddPed_RGL` never
+needs to touch streaming at all, and suspending the streaming thread around
+it costs nothing. The comment that assumed "the base vehicle set is loaded
+on every client too" (same file, above `CreateCarForScript_RGL`) is the
+part that turned out to matter: even if the Landstalker's raw model data is
+resident, `CreateCarForScript` itself may still synchronize with that
+thread for other reasons (e.g. collision data, handling data, or some
+per-spawn bookkeeping) that a plain "is the model loaded" check wouldn't
+capture.
+
+**Also worth being honest about:** the ORIGINAL 100%-reproducible crash
+this whole crash-fix effort was built around was only ever confirmed for
+ped spawn, via real testing, both for the bug itself and for v1/v2's
+fixes. Vehicle spawn was never shown to have the same race - the
+`AllThreadsSuspendGuard` wrap was added to `SpawnVehicle` symmetrically, on
+the assumption the same risk applied equally to both calls. That
+assumption is what caused this regression: it made vehicle spawn strictly
+worse (a new, reproducible hang) without ever having had evidence it was
+protecting against anything real there in the first place.
+
+**Fix applied:** `RemotePedManager::SpawnVehicle()` (`RemotePeds.cpp`) no
+longer constructs `AllThreadsSuspendGuard` around the call. It still calls
+`TryCreateCarForScript_RGL` (the `__try`/`__except` wrapper from the C2712
+fix, previous section), which still converts a genuine access-violation
+crash into a caught `nullptr` - that part costs nothing and stays. Only the
+thread-suspension is removed, specifically because it is what caused the
+observed deadlock. `SpawnPed()` is UNCHANGED - it keeps
+`AllThreadsSuspendGuard`, since that is the call with actual confirmed
+positive evidence behind it from this same test round.
+
+**Residual risk, honestly stated:** removing the guard from `SpawnVehicle`
+means the original (never actually confirmed for vehicles) race, if it
+exists there at all, is not covered by anything beyond the `__try`/
+`__except` itself - which catches a crash but does not prevent whatever
+corruption led to it. If real testing ever shows vehicle spawn crashing
+(as opposed to hanging) the same way ped spawn once did, that would need a
+*narrower* fix scoped to just the pool-insert step inside
+`CreateCarForScript`, not a blanket suspend-every-thread wrap around the
+whole call - since the whole call is exactly what must not be wrapped, per
+the deadlock just found. No such narrower fix exists yet; this is a
+documented gap, not a guess dressed up as a fix.
+
+**Changed files (this round):** `client/src/RemotePeds.cpp` (removed
+`AllThreadsSuspendGuard suspendGuard;` from `SpawnVehicle()`, expanded the
+surrounding comment with the full reasoning above). The standalone
+`FakePlayer.exe` test tool (not part of the shipped project) was also
+rewritten to automatically cycle through all four ped/vehicle states at one
+position plus periodic automatic damage tests, specifically so this gap
+would get found by routine testing rather than staying hidden until a real
+second player happened to get in a car.
+
+**Verification:** mingw sync-check compiles clean for the updated
+`RemotePeds.cpp` (`-fsyntax-only`, `__try`/`__except` neutralized the usual
+way). **Still needs:** the user must rebuild/redeploy the client `.asi` via
+GitHub Actions and re-run the FakePlayer auto-test cycle to confirm phase 3
+(in vehicle) no longer hangs the game - this has NOT been re-tested yet as
+of this writing, only reasoned through and patched.

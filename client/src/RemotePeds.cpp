@@ -212,15 +212,41 @@ CPed* RemotePedManager::SpawnPed(const proto::PlayerState& state) {
 CVehicle* RemotePedManager::SpawnVehicle(const proto::PlayerState& state) {
     CVehicle* veh = nullptr;
 
-    // Same risk and same fix as SpawnPed above - see RemotePeds.h and
-    // MainThreadGuard.h. Same C2712 reason for calling through
-    // TryCreateCarForScript_RGL instead of an inline __try/__except here.
-    {
-        AllThreadsSuspendGuard suspendGuard;
-        veh = TryCreateCarForScript_RGL(state.vehicleModel,
-                                        CVector(state.x, state.y, state.z),
-                                        /*doMissionCleanup=*/0);
-    }
+    // 2026-11-27, real-world finding: unlike SpawnPed above, this call does
+    // NOT wrap AllThreadsSuspendGuard around CreateCarForScript_RGL anymore.
+    // A real in-game test (FakePlayer's automatic test cycle, phase 3 "IN
+    // VEHICLE") reproduced a hang - the whole game froze and then had to be
+    // force-closed - every time this phase ran with the guard in place,
+    // right at vehicle creation. That matches a classic deadlock, not the
+    // original race: CreateCarForScript almost certainly needs to pump
+    // CStreaming (the game's background model/collision loader thread) to
+    // finish bringing the vehicle's resources in, and AllThreadsSuspendGuard
+    // had suspended that very thread for the whole duration of this call -
+    // so the call waits forever for a thread that can never run again until
+    // this function returns, which it can't do until that thread runs. This
+    // is a guaranteed deadlock for any vehicle that needs streaming, not the
+    // rare "mid-allocation" hang disclosed for peds in MainThreadGuard.h.
+    //
+    // Also worth noting: the ORIGINAL 100%-reproducible crash this project
+    // fixed was only ever confirmed for ped spawn (AddPed_RGL) via real
+    // testing - vehicle spawn was never actually shown to have the same
+    // race in the first place. Suspending all threads here was added
+    // symmetrically "to be safe," but that assumption turned out to make
+    // things strictly worse for vehicles. So for now: SpawnVehicle keeps
+    // the __try/__except (TryCreateCarForScript_RGL, below) - which still
+    // turns a genuine access-violation crash into a caught nullptr, with no
+    // thread-suspension cost at all - but does NOT suspend any other
+    // threads around the call.
+    //
+    // This does leave the original race (if it even exists here) formally
+    // unaddressed for vehicles. If real testing ever shows vehicle spawn
+    // crashing (not hanging) the same way ped spawn once did, that would
+    // need a narrower fix scoped to just the pool-insert step inside
+    // CreateCarForScript - not a blanket suspend-every-thread around the
+    // whole call, since that call can block on streaming.
+    veh = TryCreateCarForScript_RGL(state.vehicleModel,
+                                    CVector(state.x, state.y, state.z),
+                                    /*doMissionCleanup=*/0);
 
     if (!veh) {
         log::Error("RemotePedManager: CreateCarForScript returned null (or "
