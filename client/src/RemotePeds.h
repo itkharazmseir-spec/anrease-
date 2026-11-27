@@ -155,6 +155,21 @@ public:
     // set.
     void SetDamageDetectedCallback(std::function<void(uint32_t playerId, float healthDelta, float armourDelta)> cb);
 
+    // Item 7 ("store/purchase delivery", 2026-11-27): spawns a free-standing
+    // vehicle at an arbitrary world position via the already-verified
+    // CreateCarForScript_RGL (the same call SpawnVehicle() below uses for a
+    // remote player's avatar) - but this one is NOT tracked as anyone's
+    // avatar and nothing in this class ever moves/retires it again; once
+    // spawned, the game's own world/vehicle-pool logic owns it exactly like
+    // any other vehicle that was never driven by a remote player (e.g. one
+    // the local player parks and walks away from). Used to deliver a
+    // purchased vehicle to the local player's current position - see
+    // Main.cpp's PurchaseDelivery handling. Returns true if the vehicle was
+    // created (false on a fingerprint mismatch or a crash caught by the
+    // existing __try/__except in TryCreateCarForScript_RGL - see
+    // RemotePeds.cpp).
+    bool SpawnStandaloneVehicle(int32_t modelId, float x, float y, float z);
+
 private:
     struct RemoteAvatar {
         CPed*     ped     = nullptr; // non-null while on foot

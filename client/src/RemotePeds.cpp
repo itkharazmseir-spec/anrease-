@@ -261,6 +261,20 @@ CVehicle* RemotePedManager::SpawnVehicle(const proto::PlayerState& state) {
     return veh;
 }
 
+bool RemotePedManager::SpawnStandaloneVehicle(int32_t modelId, float x, float y, float z) {
+    CVehicle* veh = TryCreateCarForScript_RGL(modelId, CVector(x, y, z), /*doMissionCleanup=*/0);
+    if (!veh) {
+        log::Error("RemotePedManager: SpawnStandaloneVehicle failed (model %d at "
+                   "%.3f %.3f %.3f) - fingerprint mismatch, invalid model, or the "
+                   "game itself refused",
+                   modelId, x, y, z);
+        return false;
+    }
+    log::Info("RemotePedManager: spawned standalone vehicle (model %d) at %.3f %.3f %.3f",
+              modelId, x, y, z);
+    return true;
+}
+
 void RemotePedManager::RetirePed(CPed* ped) {
     if (!ped) return;
     __try {
