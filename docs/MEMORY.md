@@ -1330,3 +1330,141 @@ established), without trusting the client to ask for its own items.
 - Inherits every weapon-give limitation from item 6 above (clip-size,
   `m_pFxSystem`, not yet live-tested in-game) for weapon purchases
   specifically.
+
+## 2026-11-27 (later same day): Root cause found for "purchases never arrive in-game" - server event-loop starvation
+
+**Symptom reported by the user:** after the web store (see above) was
+confirmed working end-to-end from the browser's point of view (login
+succeeds, `purchases.txt` gets the correct line appended, e.g.
+`1|1|31|250`), and after two real in-game bugs were found and fixed
+(weapon-equip slot not being set; vehicle spawn stacking), a *third*,
+much stranger symptom remained: with the game client actually running
+and connected, and a purchase made from the website while connected,
+**nothing at all appeared in the server's own log** for that purchase -
+not even the "skipping invalid line" or "delivered purchase" messages
+that `PollPurchaseQueue` always logs one way or another. Meanwhile the
+server was demonstrably alive: it kept printing the player's `pos ...`
+line roughly ten times a second. `purchases.txt` sat on disk,
+unmodified, with the pending line still in it, for well over a minute.
+
+**Red herrings investigated and ruled out before finding the real
+cause:**
+1. **Windows Console "Quick Edit" mode.** Clicking inside a console
+   window to select/copy text pauses the *entire* process (since the
+   server writes every log line synchronously to the console) until
+   Escape is pressed or the selection released. This is a real, known
+   Windows behavior and was initially suspected, since the user had been
+   copy-pasting from the console. Ruled out: the final decisive test
+   showed the server actively printing new `pos ...` lines in real time
+   while the purchase sat undelivered, which is impossible if the whole
+   process were paused.
+2. **Notepad not refreshing an open file.** The user was viewing
+   `scripts\AndreasOnline.log` in Notepad, which does not auto-reload a
+   file that changes on disk. Initially suspected as the reason the log
+   appeared to stop advancing. Ruled out directly: reading the same file
+   straight off disk via the device bridge (bypassing Notepad entirely)
+   confirmed, independently of Notepad, that the log genuinely was
+   advancing in real time during the decisive test.
+
+**Actual root cause: `server/src/Main.cpp`'s main loop could starve the
+purchase-poll code indefinitely under continuous network traffic.**
+
+The loop was structured as:
+```cpp
+while (!g_shutdownRequested) {
+    while (enet_host_service(host, &event, 1000) > 0) {
+        switch (event.type) { /* CONNECT / RECEIVE / DISCONNECT */ }
+    }
+    // purchase poll (PollPurchaseQueue) was only checked HERE,
+    // after the inner "drain all pending events" loop had exited.
+}
+```
+The game client sends a `PlayerState` position update roughly every
+100ms (~10 Hz) whenever connected - this is by design, documented
+elsewhere in this file as the project's position-sync rate. The inner
+`while (enet_host_service(...) > 0)` loop only falls through to the
+purchase-poll line once there happens to be a brief gap with *zero*
+pending ENet events. With a client continuously sending packets at
+~10 Hz, there is effectively always another event ready by the time
+`enet_host_service` is called again, so the inner loop's `> 0`
+condition can stay true indefinitely - meaning the purchase-poll call
+positioned after it never runs for as long as any player stays
+connected and active. This exactly explains every symptom: position
+updates and chat kept working fine (they're handled *inside* the
+starved inner loop), while `purchases.txt` could sit undrained
+indefinitely despite the server being provably alive.
+
+This bug was invisible to all of this session's earlier server-side
+testing of the purchase feature, because those tests used short-lived,
+purpose-written ENet clients that sent only a handful of messages and
+then went quiet - which let the inner loop's event queue empty out
+naturally between sends, exposing the purchase-poll line on schedule.
+It only manifests under continuous, real-game-like traffic, which is
+exactly what the user's own live playtest supplied for the first time.
+
+**Fix:** restructure the poll check into a small `pollPurchasesIfDue()`
+lambda, called once per handled event *inside* the inner drain loop (in
+addition to once per outer-loop iteration as before). The lambda is
+still rate-limited to roughly once every `kPurchasePollIntervalMs` via
+the existing `lastPurchasePollMs` timestamp guard, so calling it more
+often costs essentially nothing - it is a no-op on almost every call,
+and only actually re-reads `purchases.txt` when the interval has
+elapsed:
+```cpp
+const auto pollPurchasesIfDue = [&]() {
+    const uint32_t now = enet_time_get();
+    if (lastPurchasePollMs == 0 || (now - lastPurchasePollMs) >= kPurchasePollIntervalMs) {
+        lastPurchasePollMs = now;
+        PollPurchaseQueue(host);
+    }
+};
+...
+while (enet_host_service(host, &event, 1000) > 0) {
+    switch (event.type) { ... }
+    pollPurchasesIfDue();   // <-- new: also checked after every drained event
+}
+pollPurchasesIfDue();       // unchanged: still checked once per outer-loop pass too
+```
+This closes the starvation gap completely: the purchase queue is now
+polled on a regular cadence regardless of how busy the inner event-drain
+loop is kept.
+
+**Verification methodology (this is the first bug this session caught
+via a dedicated regression test rather than a one-off manual check):**
+wrote a new ENet test client, `flood_test.cpp`, that:
+1. Connects and completes the account handshake.
+2. Immediately starts sending `PlayerState` updates continuously at
+   ~10 Hz (mirroring the real game client's rate) and **never stops**
+   for the whole test duration - unlike every earlier test client this
+   session, which sent a handful of messages and went quiet.
+3. At t=+3s, while the flood is still running, writes a line directly
+   to `purchases.txt`.
+4. Waits up to 20 seconds for a `PurchaseDelivery` packet to arrive.
+
+Run against the **old** (pre-fix) server binary, in an isolated test
+directory: **[FAIL] no PurchaseDelivery within 20s despite continuous
+flood** - `purchases.txt` left on disk with the pending line still
+undrained. This reproduces the exact symptom the user reported.
+
+Run against the **new** (post-fix) server binary, same test, same
+isolated-directory setup: **[PASS] PurchaseDelivery received at
+t=+4135ms** (about 1.1s after the line was written, consistent with the
+existing ~2-second poll interval) - `purchases.txt` left empty/drained,
+and the server log showed the normal "delivered purchase (...)" line.
+The flood never paused during either run.
+
+(One internal test-harness mistake along the way, caught before drawing
+any conclusion: the first two reproduction attempts passed a custom
+purchases filename to the test client via a command-line argument, but
+`PollPurchaseQueue()` on the server side is hardcoded to always read the
+literal relative path `"purchases.txt"` - so neither of those first two
+runs actually proved anything, since the server was reading a file that
+was never written to. Fixed by running each test in its own empty
+working directory and always using the literal filename `purchases.txt`
+for the file the server actually polls.)
+
+**Status:** fix applied to `server/src/Main.cpp`, pushed to the user's
+project and verified byte-for-byte identical on their machine. Not yet
+verified with the real game client in a live in-game test (the server
+rebuild and final live retest are left for the user to run, same as
+every other in-game-only verification step in this file).

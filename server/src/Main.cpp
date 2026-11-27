@@ -765,6 +765,32 @@ int main(int argc, char** argv) {
 
     ENetEvent event;
     uint32_t lastPurchasePollMs = 0;
+
+    // 2026-11-27, found during the first live playtest of the store: this
+    // used to be checked only AFTER the "while (enet_host_service(...) > 0)"
+    // drain loop below had exited. That's fine when the network goes quiet
+    // for a moment, but it is NOT fine under steady traffic - this server
+    // also broadcasts/receives position updates at roughly 10 Hz (every
+    // ~100ms) per connected player, which is faster than the drain loop's
+    // own work takes. As long as a new event is always waiting by the time
+    // enet_host_service() is called again, its "> 0" condition stays true
+    // indefinitely and the loop never falls through - meaning the code that
+    // used to sit after it (this purchase poll) could be starved for as
+    // long as ANY player stayed connected and moving, which is exactly what
+    // happened: purchases.txt sat completely untouched for over a minute
+    // with a player actively connected, confirmed via a live test. Calling
+    // this once per event too (not just once per drain-loop exit) closes
+    // that gap - it's a no-op almost every call (lastPurchasePollMs guards
+    // it to roughly once every kPurchasePollIntervalMs regardless of how
+    // often it's invoked), so the extra calls cost nothing.
+    const auto pollPurchasesIfDue = [&]() {
+        const uint32_t now = enet_time_get();
+        if (lastPurchasePollMs == 0 || (now - lastPurchasePollMs) >= kPurchasePollIntervalMs) {
+            lastPurchasePollMs = now;
+            PollPurchaseQueue(host);
+        }
+    };
+
 #if defined(_WIN32)
     while (!g_shutdownRequested) {
 #else
@@ -787,18 +813,13 @@ int main(int argc, char** argv) {
                 default:
                     break;
             }
+            pollPurchasesIfDue();
         }
 
-        // Item 7 ("store/purchase delivery") - checked once per loop
-        // iteration (enet_host_service above returns at least every 1000ms
-        // even with no network activity, so this polls roughly every
-        // kPurchasePollIntervalMs regardless of player activity).
-        const uint32_t nowForPurchases = enet_time_get();
-        if (lastPurchasePollMs == 0 ||
-            (nowForPurchases - lastPurchasePollMs) >= kPurchasePollIntervalMs) {
-            lastPurchasePollMs = nowForPurchases;
-            PollPurchaseQueue(host);
-        }
+        // Item 7 ("store/purchase delivery") - also reached here in the
+        // normal case where there's no network activity right now (the
+        // drain loop above never ran this iteration).
+        pollPurchasesIfDue();
     }
 
 #if defined(_WIN32)
