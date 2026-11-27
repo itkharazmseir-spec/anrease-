@@ -1,5 +1,6 @@
 #include "ao/NetworkClient.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include <enet/enet.h>
@@ -17,6 +18,7 @@ namespace {
 constexpr enet_uint8 kChannelReliable   = 0;
 constexpr enet_uint8 kChannelUnreliable = 1;
 constexpr enet_uint8 kChannelCount      = 2;
+constexpr uint32_t   kReconnectIntervalMs = 5000;
 
 bool g_enetInitialized = false;
 
@@ -55,6 +57,17 @@ NetworkClient::~NetworkClient() {
 void NetworkClient::Connect(const std::string& host, uint16_t port, const std::string& playerName) {
     if (!m_enetOk) return;
 
+    // Remember these so Poll() can retry with the same parameters later -
+    // set before anything below can fail/return early, and before
+    // Disconnect() (which doesn't touch these fields), so a reconnect always
+    // has the right target even if this particular attempt never gets as
+    // far as creating a peer.
+    m_lastHost = host;
+    m_lastPort = port;
+    m_pendingPlayerName = playerName;
+    m_autoReconnect = true;
+    m_reconnectScheduled = false; // this call *is* the (re)connect attempt
+
     Disconnect(); // drop any previous attempt/connection first
 
     m_host = reinterpret_cast<_ENetHost*>(enet_host_create(nullptr, 1, kChannelCount, 0, 0));
@@ -72,7 +85,6 @@ void NetworkClient::Connect(const std::string& host, uint16_t port, const std::s
     }
     addr.port = port;
 
-    m_pendingPlayerName = playerName;
     m_peer = reinterpret_cast<_ENetPeer*>(
         enet_host_connect(reinterpret_cast<ENetHost*>(m_host), &addr, kChannelCount, 0));
     if (!m_peer) {
@@ -99,7 +111,8 @@ void NetworkClient::Disconnect() {
     m_localPlayerId = 0;
 
     std::lock_guard<std::mutex> lock(m_playersMutex);
-    m_players.clear();
+    m_baseNames.clear();
+    m_playerHealth.clear();
 }
 
 void NetworkClient::HandleConnect() {
@@ -127,6 +140,25 @@ void NetworkClient::HandleDisconnect() {
     m_handshakeAccepted = false;
     m_localPlayerId = 0;
     m_peer = nullptr; // the host destroyed the peer object already
+
+    {
+        std::lock_guard<std::mutex> lock(m_playersMutex);
+        m_baseNames.clear();
+        m_playerHealth.clear();
+    }
+
+    // This fires both for "lost an established connection" and for "the
+    // connect attempt itself never completed" (ENet reports both as a
+    // DISCONNECT event) - either way, retry later rather than requiring a
+    // plugin/game reload. Not done for an app-level handshake rejection
+    // (ProtocolMismatch/ServerFull): that's a successful ENet connection, so
+    // no DISCONNECT event happens here - see HandlePacket's HandshakeAck case.
+    if (m_autoReconnect) {
+        m_reconnectScheduled = true;
+        m_nextReconnectAtMs = NowMs() + kReconnectIntervalMs;
+        log::Info("NetworkClient: will retry %s:%u in %u ms",
+                  m_lastHost.c_str(), m_lastPort, kReconnectIntervalMs);
+    }
 }
 
 void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
@@ -146,7 +178,8 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                 log::Info("NetworkClient: handshake accepted, player id = %u", m_localPlayerId);
                 {
                     std::lock_guard<std::mutex> lock(m_playersMutex);
-                    m_players[m_localPlayerId] = m_pendingPlayerName + " (you)";
+                    m_baseNames[m_localPlayerId] = m_pendingPlayerName;
+                    m_playerHealth[m_localPlayerId] = 100.0f; // until our own PlayerState echoes back
                 }
             } else {
                 const char* reason =
@@ -154,6 +187,18 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                     ack.result == proto::HandshakeResult::ServerFull       ? "server full" :
                                                                               "unknown";
                 log::Error("NetworkClient: handshake rejected (%s)", reason);
+
+                // enet_peer_disconnect_later (used by the server for a
+                // rejection) still delivers a real ENET_EVENT_TYPE_DISCONNECT
+                // once the notification flushes, which would otherwise make
+                // HandleDisconnect() schedule a reconnect - retrying forever
+                // against a server that will keep rejecting us the same way.
+                // ProtocolMismatch can never succeed (the binaries don't
+                // match), so stop entirely; ServerFull may free up a slot
+                // later, so keep retrying for that one only.
+                if (ack.result == proto::HandshakeResult::ProtocolMismatch) {
+                    m_autoReconnect = false;
+                }
             }
             break;
         }
@@ -166,7 +211,8 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                 const std::string name = ClampedName(joined.playerName, proto::kMaxNameLen);
                 log::Info("NetworkClient: player %u ('%s') joined", joined.playerId, name.c_str());
                 std::lock_guard<std::mutex> lock(m_playersMutex);
-                m_players[joined.playerId] = name;
+                m_baseNames[joined.playerId] = name;
+                m_playerHealth[joined.playerId] = 100.0f; // until their first PlayerState arrives
             }
             break;
         }
@@ -177,19 +223,22 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             log::Info("NetworkClient: player %u left", left.playerId);
             {
                 std::lock_guard<std::mutex> lock(m_playersMutex);
-                m_players.erase(left.playerId);
+                m_baseNames.erase(left.playerId);
+                m_playerHealth.erase(left.playerId);
             }
+            if (m_playerLeftCallback) m_playerLeftCallback(left.playerId);
             break;
         }
         case proto::MessageType::PlayerState: {
             if (bodyLen != sizeof(proto::PlayerState)) return;
             proto::PlayerState state{};
             std::memcpy(&state, body, sizeof(state));
+            {
+                std::lock_guard<std::mutex> lock(m_playersMutex);
+                m_playerHealth[state.playerId] = state.health;
+            }
             if (state.playerId == m_localPlayerId) break; // our own, echoed back
-            // Step 3 (not implemented yet) will move/spawn a real CPed here
-            // instead of just logging it.
-            log::Info("NetworkClient: remote player %u pos %.3f %.3f %.3f veh %d",
-                      state.playerId, state.x, state.y, state.z, state.vehicleModel);
+            if (m_playerStateCallback) m_playerStateCallback(state);
             break;
         }
         case proto::MessageType::ChatMessage: {
@@ -201,13 +250,28 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             if (m_chatCallback) m_chatCallback(msg.playerId, text);
             break;
         }
+        case proto::MessageType::DamageReport: {
+            if (bodyLen != sizeof(proto::DamageReport)) return;
+            proto::DamageReport report{};
+            std::memcpy(&report, body, sizeof(report));
+            if (m_damageReportCallback) m_damageReportCallback(report);
+            break;
+        }
         default:
             break;
     }
 }
 
 void NetworkClient::Poll() {
-    if (!m_enetOk || !m_host) return;
+    if (!m_enetOk) return;
+
+    if (m_reconnectScheduled && NowMs() >= m_nextReconnectAtMs) {
+        m_reconnectScheduled = false;
+        log::Info("NetworkClient: retrying connection to %s:%u...", m_lastHost.c_str(), m_lastPort);
+        Connect(m_lastHost, m_lastPort, m_pendingPlayerName);
+    }
+
+    if (!m_host) return;
 
     ENetEvent event;
     while (enet_host_service(reinterpret_cast<ENetHost*>(m_host), &event, 0) > 0) {
@@ -243,9 +307,43 @@ void NetworkClient::SendPlayerState(const proto::PlayerState& stateIn) {
     enet_peer_send(reinterpret_cast<ENetPeer*>(m_peer), kChannelUnreliable, packet);
 }
 
+void NetworkClient::SendDamageReport(uint32_t victimPlayerId, float healthDelta, float armourDelta) {
+    if (!IsReady()) return;
+
+    proto::DamageReport report{};
+    report.victimPlayerId = victimPlayerId;
+    report.attackerPlayerId = m_localPlayerId; // server overwrites it anyway; set for clarity
+    report.healthDelta = healthDelta;
+    report.armourDelta = armourDelta;
+
+    uint8_t buf[1 + sizeof(proto::DamageReport)];
+    buf[0] = static_cast<uint8_t>(proto::MessageType::DamageReport);
+    std::memcpy(buf + 1, &report, sizeof(report));
+
+    // Reliable (channel 0), unlike SendPlayerState - a damage event must
+    // never be silently dropped the way an occasional stale position update
+    // can be.
+    ENetPacket* packet = enet_packet_create(buf, sizeof(buf), ENET_PACKET_FLAG_RELIABLE);
+    enet_peer_send(reinterpret_cast<ENetPeer*>(m_peer), kChannelReliable, packet);
+}
+
 std::vector<std::pair<uint32_t, std::string>> NetworkClient::GetPlayers() const {
     std::lock_guard<std::mutex> lock(m_playersMutex);
-    return std::vector<std::pair<uint32_t, std::string>>(m_players.begin(), m_players.end());
+    std::vector<std::pair<uint32_t, std::string>> result;
+    result.reserve(m_baseNames.size());
+    for (const auto& [id, name] : m_baseNames) {
+        const auto hpIt = m_playerHealth.find(id);
+        const float hp = (hpIt != m_playerHealth.end()) ? hpIt->second : 0.0f;
+
+        char buf[80];
+        if (id == m_localPlayerId) {
+            std::snprintf(buf, sizeof(buf), "%s (you) [HP %.0f]", name.c_str(), hp);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s [HP %.0f]", name.c_str(), hp);
+        }
+        result.emplace_back(id, buf);
+    }
+    return result;
 }
 
 void NetworkClient::SetChatCallback(std::function<void(uint32_t, const std::string&)> cb) {
@@ -253,6 +351,18 @@ void NetworkClient::SetChatCallback(std::function<void(uint32_t, const std::stri
     // only ever invoked from that same polling thread (inside Poll()) - no
     // lock needed for the std::function itself.
     m_chatCallback = std::move(cb);
+}
+
+void NetworkClient::SetPlayerStateCallback(std::function<void(const proto::PlayerState&)> cb) {
+    m_playerStateCallback = std::move(cb);
+}
+
+void NetworkClient::SetPlayerLeftCallback(std::function<void(uint32_t)> cb) {
+    m_playerLeftCallback = std::move(cb);
+}
+
+void NetworkClient::SetDamageReportCallback(std::function<void(const proto::DamageReport&)> cb) {
+    m_damageReportCallback = std::move(cb);
 }
 
 void NetworkClient::SendChatMessage(const std::string& text) {

@@ -5,17 +5,28 @@
 //   - requires a Handshake with a matching protocol version before treating
 //     a connection as a real player
 //   - tracks connected players (id, name, last known PlayerState)
-//   - rebroadcasts PlayerState and ChatMessage from one client to everyone
-//     (including back to the sender - the client is expected to ignore a
-//     PlayerState/ChatMessage whose playerId is its own)
+//   - rebroadcasts PlayerState, ChatMessage, and DamageReport (protocol v3,
+//     2026-11-27 - see shared/include/ao/Protocol.h) from one client to
+//     everyone (including back to the sender - the client is expected to
+//     ignore one of these whose relevant id is its own, except a
+//     DamageReport it should act on - see NetworkClient.h)
 //   - announces PlayerJoined/PlayerLeft to everyone, and replays the current
 //     roster (as a PlayerJoined per existing player) to a client that just
 //     finished its handshake, so it learns who is already online
+//   - enforces a max player cap (default 32, overridable via argv[2]) and
+//     replies HandshakeResult::ServerFull when it's reached
+//   - rate-limits chat (max 1 message per kMinChatIntervalMs per player) to
+//     cut down on spam
+//   - on Windows, handles Ctrl+C / console close gracefully: disconnects all
+//     peers cleanly instead of just dying
+//   - reads port/maxPlayers from server.cfg next to the executable (see
+//     ServerConfig.h), overridable by command-line args
+//   - strips control characters from player names and chat text before
+//     storing/broadcasting them (SanitizeAscii/SanitizeCharBuffer)
 //
 // What this deliberately does NOT do yet (future steps):
 //   - no world simulation, no vehicle ownership/authority, no anti-cheat
 //     validation of incoming positions
-//   - no graceful shutdown (Ctrl+C just kills the process)
 #include <enet/enet.h>
 
 #include <cstdarg>
@@ -25,8 +36,19 @@
 #include <string>
 #include <unordered_map>
 
+#if defined(_WIN32)
+// enet/win32.h (included via enet/enet.h above, before this point) already
+// pulled in <winsock2.h>, which guards itself with _WINSOCKAPI_ - windows.h
+// checks that guard internally and skips its own (conflicting) <winsock.h>,
+// so it's safe to include windows.h afterward as long as enet/enet.h stays
+// above this block. Do NOT move this include above the enet one.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include "ao/Protocol.h"
 #include "ao/Version.h"
+#include "ServerConfig.h"
 
 namespace {
 
@@ -59,19 +81,56 @@ std::string ClampedName(const char* raw, size_t maxLen) {
     return std::string(raw, len);
 }
 
+// Replaces any non-printable byte (control characters, including newline/
+// tab/escape) with '?' in place. A malicious or buggy client could otherwise
+// send a player name or chat message containing e.g. embedded newlines or
+// terminal escape sequences, which would get relayed verbatim to every other
+// client (corrupting their log files/UI) and printed verbatim into this
+// server's own console/log.
+void SanitizeAscii(std::string& s) {
+    for (char& c : s) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F) {
+            c = '?';
+        }
+    }
+}
+
+// Same idea, but for a fixed-size char buffer that isn't guaranteed to be
+// null-terminated (the wire format's char[] fields) - sanitizes up to the
+// first '\0' or maxLen, whichever comes first, and mutates in place so the
+// *actual bytes that get broadcast* are cleaned, not just a derived copy.
+void SanitizeCharBuffer(char* buf, size_t maxLen) {
+    for (size_t i = 0; i < maxLen && buf[i] != '\0'; ++i) {
+        const auto uc = static_cast<unsigned char>(buf[i]);
+        if (uc < 0x20 || uc == 0x7F) {
+            buf[i] = '?';
+        }
+    }
+}
+
 struct ConnectedPlayer {
     uint32_t              id = 0;
     std::string           name;
     ENetPeer*             peer = nullptr;
     bool                  handshakeDone = false;
     ao::proto::PlayerState lastState{};
+    uint32_t              lastChatMs = 0; // enet_time_get() at last accepted
+                                           // ChatMessage, for anti-spam
 };
 
 constexpr enet_uint8 kChannelReliable   = 0;
 constexpr enet_uint8 kChannelUnreliable = 1;
 constexpr enet_uint8 kChannelCount      = 2;
 
+// A player may send at most one ChatMessage per this many milliseconds;
+// anything faster is silently dropped (not queued/delayed) rather than
+// disconnecting the spammer.
+constexpr uint32_t kMinChatIntervalMs = 400;
+
 uint32_t g_nextPlayerId = 1;
+uint32_t g_maxPlayers   = 32; // overridable via argv[2]; also used as the
+                               // ENetHost peerCount
 std::unordered_map<uint32_t, ConnectedPlayer> g_players; // key: playerId
 
 uint32_t PlayerIdFromPeer(ENetPeer* peer) {
@@ -128,10 +187,21 @@ void HandleHandshake(ENetHost* host, ENetPeer* peer, const uint8_t* data, size_t
         return;
     }
 
+    if (g_players.size() >= g_maxPlayers) {
+        LogLine("rejecting peer: server full (%zu/%u)", g_players.size(), g_maxPlayers);
+        ao::proto::HandshakeAck ack{};
+        ack.result = ao::proto::HandshakeResult::ServerFull;
+        ack.assignedPlayerId = 0;
+        SendMessage(peer, ao::proto::MessageType::HandshakeAck, ack, /*reliable=*/true);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
     const uint32_t id = g_nextPlayerId++;
     ConnectedPlayer& player = g_players[id];
     player.id = id;
     player.name = ClampedName(hs.playerName, ao::proto::kMaxNameLen);
+    SanitizeAscii(player.name);
     if (player.name.empty()) {
         player.name = "Player" + std::to_string(id);
     }
@@ -186,18 +256,63 @@ void HandlePlayerState(ENetHost* host, ENetPeer* peer, const uint8_t* data, size
     BroadcastMessage(host, ao::proto::MessageType::PlayerState, state, /*reliable=*/false);
 }
 
+void HandleDamageReport(ENetHost* host, ENetPeer* peer, const uint8_t* data, size_t len) {
+    const uint32_t id = PlayerIdFromPeer(peer);
+    if (id == 0) return; // no handshake yet, ignore
+    if (len != sizeof(ao::proto::DamageReport)) return;
+
+    auto it = g_players.find(id);
+    if (it == g_players.end()) return;
+
+    ao::proto::DamageReport report{};
+    std::memcpy(&report, data, sizeof(report));
+    report.attackerPlayerId = id; // never trust the sender's own id field
+
+    // The named victim must be a currently-connected player - otherwise this
+    // is either stale (they already disconnected) or bogus; drop it rather
+    // than broadcasting a report nobody can apply.
+    if (g_players.find(report.victimPlayerId) == g_players.end()) return;
+
+    // Clamp to GTA SA's own default health/armour range (see Protocol.h).
+    // A buggy or malicious client could otherwise claim an arbitrarily large
+    // delta; this bounds the worst case to "as if hit by the single biggest
+    // legitimate hit" rather than an unverifiable instant kill from anywhere
+    // on the map.
+    if (report.healthDelta < 0.0f) report.healthDelta = 0.0f;
+    if (report.healthDelta > 100.0f) report.healthDelta = 100.0f;
+    if (report.armourDelta < 0.0f) report.armourDelta = 0.0f;
+    if (report.armourDelta > 100.0f) report.armourDelta = 100.0f;
+
+    LogLine("player %u dealt %.1f hp / %.1f armour damage to player %u",
+            report.attackerPlayerId, report.healthDelta, report.armourDelta, report.victimPlayerId);
+
+    BroadcastMessage(host, ao::proto::MessageType::DamageReport, report, /*reliable=*/true);
+}
+
 void HandleChatMessage(ENetHost* host, ENetPeer* peer, const uint8_t* data, size_t len) {
     const uint32_t id = PlayerIdFromPeer(peer);
     if (id == 0) return;
     if (len != sizeof(ao::proto::ChatMessage)) return;
 
+    auto it = g_players.find(id);
+    if (it == g_players.end()) return;
+
+    const uint32_t now = enet_time_get();
+    if (it->second.lastChatMs != 0 && (now - it->second.lastChatMs) < kMinChatIntervalMs) {
+        // Spamming faster than the allowed rate - drop silently rather than
+        // disconnecting; the sender just doesn't see their own message
+        // broadcast back.
+        return;
+    }
+    it->second.lastChatMs = now;
+
     ao::proto::ChatMessage msg{};
     std::memcpy(&msg, data, sizeof(msg));
     msg.playerId = id;
+    SanitizeCharBuffer(msg.text, ao::proto::kMaxChatLen);
 
-    auto it = g_players.find(id);
     const std::string text = ClampedName(msg.text, ao::proto::kMaxChatLen);
-    LogLine("chat: %s: %s", it != g_players.end() ? it->second.name.c_str() : "?", text.c_str());
+    LogLine("chat: %s: %s", it->second.name.c_str(), text.c_str());
 
     BroadcastMessage(host, ao::proto::MessageType::ChatMessage, msg, /*reliable=*/true);
 }
@@ -234,6 +349,9 @@ void HandlePacket(ENetHost* host, ENetPeer* peer, const ENetPacket* packet) {
         case ao::proto::MessageType::ChatMessage:
             HandleChatMessage(host, peer, body, bodyLen);
             break;
+        case ao::proto::MessageType::DamageReport:
+            HandleDamageReport(host, peer, body, bodyLen);
+            break;
         default:
             // Unknown/unexpected message type for something the server
             // should receive (HandshakeAck/PlayerJoined/PlayerLeft are
@@ -242,14 +360,52 @@ void HandlePacket(ENetHost* host, ENetPeer* peer, const ENetPacket* packet) {
     }
 }
 
+#if defined(_WIN32)
+// volatile: written from the console-control-handler thread, read from
+// main()'s loop.
+volatile bool g_shutdownRequested = false;
+
+BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    switch (ctrlType) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+            g_shutdownRequested = true;
+            // Give main() a moment to notice the flag and shut down
+            // gracefully (flush the disconnect broadcast, close the log)
+            // before Windows kills the process for real on CTRL_CLOSE_EVENT.
+            Sleep(1500);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
-    uint16_t port = 7777;
+    // server.cfg (next to the executable) sets the base port/maxPlayers;
+    // command-line args, if given, override whatever it set. Missing file ->
+    // ServerConfig's own built-in defaults (port 7777, 32 players).
+    const ao::ServerConfig fileCfg = ao::LoadServerConfig("server.cfg");
+    uint16_t port = fileCfg.port;
+    g_maxPlayers = fileCfg.maxPlayers;
+
     if (argc > 1) {
-        port = static_cast<uint16_t>(std::atoi(argv[1]));
-        if (port == 0) port = 7777;
+        const int argPort = std::atoi(argv[1]);
+        if (argPort > 0 && argPort <= 65535) port = static_cast<uint16_t>(argPort);
     }
+    if (argc > 2) {
+        const int maxPlayers = std::atoi(argv[2]);
+        if (maxPlayers > 0) {
+            g_maxPlayers = static_cast<uint32_t>(maxPlayers);
+        }
+    }
+
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
 
     if (enet_initialize() != 0) {
         LogLine("ERROR: enet_initialize failed");
@@ -260,18 +416,23 @@ int main(int argc, char** argv) {
     address.host = ENET_HOST_ANY;
     address.port = port;
 
-    ENetHost* host = enet_host_create(&address, /*peerCount=*/32, kChannelCount, 0, 0);
+    ENetHost* host = enet_host_create(&address, /*peerCount=*/g_maxPlayers, kChannelCount, 0, 0);
     if (!host) {
         LogLine("ERROR: enet_host_create failed (port %u already in use?)", port);
         enet_deinitialize();
         return 1;
     }
 
-    LogLine("%s %s listening on UDP port %u (protocol %u)",
-             ao::kProductName, ao::kVersionString, port, ao::kProtocolVersion);
+    LogLine("%s %s listening on UDP port %u (protocol %u, max players %u)",
+             ao::kProductName, ao::kVersionString, port, ao::kProtocolVersion, g_maxPlayers);
+    LogLine("usage: %s [port] [maxPlayers]  (or set port=/max_players= in server.cfg)", argv[0]);
 
     ENetEvent event;
+#if defined(_WIN32)
+    while (!g_shutdownRequested) {
+#else
     for (;;) {
+#endif
         while (enet_host_service(host, &event, 1000) > 0) {
             switch (event.type) {
                 case ENET_EVENT_TYPE_CONNECT:
@@ -291,6 +452,14 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+#if defined(_WIN32)
+    LogLine("shutting down (console close/ctrl-c) - disconnecting %zu player(s)...", g_players.size());
+    for (auto& [id, player] : g_players) {
+        if (player.peer) enet_peer_disconnect_now(player.peer, 0);
+    }
+    enet_host_flush(host);
+#endif
 
     enet_host_destroy(host);
     enet_deinitialize();

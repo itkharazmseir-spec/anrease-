@@ -45,16 +45,40 @@
 // points at an address nobody is listening on, the plugin logs that and
 // keeps working exactly as it did before networking existed - position
 // tracking and the local log are never affected by the network state.
-// Remote players' PlayerState updates are only logged for now (see
-// NetworkClient::HandlePacket) - actually spawning/moving a CPed for them
-// is step 3, and is blocked on finding CPopulation::AddPed's real address
-// for this build (the RGL exe turned out to be ~3x the size of 1.0 US with
-// this whole code region restructured - see ao/GameAddrs.h notes once that
-// search resumes). Until then, remote players are made visible a different
-// way that needs ZERO new game addresses: a standalone Win32 overlay window
-// (ao::Overlay) showing connection status, the player roster, and chat -
-// drawn entirely outside the game's own renderer, so it works regardless of
-// whether a drawingEvent/AddPed address is ever found. See Overlay.h.
+// A standalone Win32 overlay window (ao::Overlay) also shows connection
+// status, the player roster, and chat - drawn entirely outside the game's
+// own renderer, so it keeps working regardless of game-address risk below.
+// See Overlay.h.
+//
+// --- REMOTE PEDS + VEHICLE SYNC (step 3, 2026-11-26) --------------------
+// CPopulation::AddPed's real address for this RGL build was found (see
+// ao/GameAddrs.h for the full evidence chain) - remote players now get a
+// real, visible CPed via ao::RemotePedManager (RemotePeds.h/.cpp), spawned
+// and updated from NetworkClient's PlayerState/PlayerLeft callbacks, wired
+// up below. CCarCtrl::CreateCarForScript's real address was found the same
+// way shortly after (also in GameAddrs.h) - a remote player who is driving
+// now shows up as a real, moving CVehicle of the right model instead of a
+// ped floating at the car's position; RemotePedManager switches between a
+// ped and a vehicle per player as their PlayerState.vehicleModel changes.
+// This is the riskiest game-memory interaction in the project so far:
+// unlike every previous address (all read-only), AddPed/CreateCarForScript
+// allocate into and mutate the game's own global ped/vehicle pools from this
+// background polling thread, with no verified-safe main-thread hook to do
+// it on instead - see RemotePeds.h for the full risk disclosure. Treat this
+// as experimental: save your game before testing, and watch for crashes.
+//
+// --- DAMAGE SYNC (item 5, 2026-11-27) -----------------------------------
+// Real weapon-fire detection (CPed::GiveWeapon or equivalent) was
+// investigated and could not be completed for this build - see
+// docs/RGL_COMPAT_NOTES.md's "Item 5" section for the full, honest account
+// (merged/un-splittable function blobs, one false-positive address, and an
+// unresolvable CFG-style indirect thunk). Instead, RemotePedManager watches
+// each remote avatar's CPed::m_fHealth/m_fArmour - fields this project
+// already reads/writes safely - for a drop caused by OUR OWN local engine
+// (we shot it, an explosion, a collision, anything) and reports it over the
+// network as a new DamageReport message; the real victim's own client then
+// applies it to their own real ped. No new game address is used anywhere in
+// this feature.
 
 #include "plugin.h"
 
@@ -65,6 +89,7 @@
 #include "LocalPlayer.h"
 #include "Log.h"
 #include "NetworkConfig.h"
+#include "RemotePeds.h"
 
 #include <cstdio>
 #include <string>
@@ -74,9 +99,10 @@ using namespace plugin;
 
 namespace {
 
-ao::LocalPlayer   g_localPlayer;
-ao::NetworkClient g_network;
-ao::Overlay       g_overlay;
+ao::LocalPlayer      g_localPlayer;
+ao::NetworkClient    g_network;
+ao::Overlay          g_overlay;
+ao::RemotePedManager g_remotePeds;
 
 constexpr DWORD kPollIntervalMs    = 50;    // local player snapshot refresh rate
 constexpr DWORD kLogIntervalMs     = 5000;  // unchanged from the original design
@@ -92,6 +118,14 @@ DWORD WINAPI PollThreadProc(LPVOID) {
         g_localPlayer.Update();
         g_network.Poll();
 
+        // Unconditional, every loop iteration (every kPollIntervalMs = 50ms)
+        // rather than gated behind one of the interval counters below: this
+        // is what actually blends each remote avatar towards its latest
+        // network keyframe, so it needs to run far more often than new
+        // keyframes arrive (every kNetSendIntervalMs = 100ms) to produce
+        // smooth motion instead of a visible step every other tick.
+        g_remotePeds.Tick();
+
         const auto& s = g_localPlayer.Snapshot();
 
         if (s.valid && msSinceLastSend >= kNetSendIntervalMs) {
@@ -105,6 +139,7 @@ DWORD WINAPI PollThreadProc(LPVOID) {
             state.health = s.health;
             state.armour = s.armour;
             state.vehicleModel = s.inVehicle ? s.vehicleModel : -1;
+            state.pedModel = s.pedModel;
             g_network.SendPlayerState(state);
         }
 
@@ -175,6 +210,66 @@ public:
             std::snprintf(line, sizeof(line), "[%u] %s", playerId, text.c_str());
             g_overlay.AddChatLine(line);
         });
+
+        // Wire remote-player PlayerState/PlayerLeft to RemotePedManager, so
+        // other players get a real CPed (or CVehicle while driving) - see
+        // RemotePeds.h for how and the risk disclosure. If either fingerprint
+        // doesn't match (game updated since 2026-11-26), RemotePedManager
+        // itself refuses every spawn attempt for that one rather than
+        // calling into unknown code - these are only log lines here, they do
+        // not disable the rest of the plugin.
+        if (!ao::VerifyAddPedFingerprint()) {
+            ao::log::Error("AddPed fingerprint mismatch - remote players will "
+                           "not get a real in-game character (overlay roster "
+                           "still works). Re-run the Ghidra analysis in "
+                           "GameAddrs.h and update the address.");
+        }
+        if (!ao::VerifyCreateCarForScriptFingerprint()) {
+            ao::log::Error("CreateCarForScript fingerprint mismatch - remote "
+                           "players driving a vehicle will not get a real "
+                           "in-game vehicle. Re-run the Ghidra analysis in "
+                           "GameAddrs.h and update the address.");
+        }
+        if (!ao::VerifySetHeadingFingerprint()) {
+            ao::log::Error("SetHeading fingerprint mismatch - remote peds/"
+                           "vehicles will be positioned correctly but will "
+                           "not visually turn to face the right direction. "
+                           "Re-run the Ghidra analysis in GameAddrs.h and "
+                           "update the address.");
+        }
+        g_network.SetPlayerStateCallback([](const ao::proto::PlayerState& state) {
+            // Only records this as the next interpolation keyframe; it does
+            // not move the ped/vehicle itself. PollThreadProc's Tick() call
+            // (every 50ms) is what actually blends towards it, smoothing out
+            // the ~100ms gaps between PlayerState packets instead of
+            // teleporting to each one as it arrives.
+            g_remotePeds.OnNetworkUpdate(state);
+        });
+        g_network.SetPlayerLeftCallback([](uint32_t playerId) {
+            g_remotePeds.MarkDisconnected(playerId);
+        });
+
+        // Item 5 ("weapon/damage sync", 2026-11-27): RemotePedManager
+        // watches each remote avatar ped for a health/armour drop caused by
+        // OUR OWN local game engine (we shot it, it was in an explosion,
+        // etc. - see RemotePeds.h's class comment for the full design) and
+        // reports it here; we forward it to the server, which relays it to
+        // the real victim's own client. Conversely, when a DamageReport
+        // arrives naming US as the victim, we apply it to our own real ped.
+        // No new game address is used anywhere in this - see Protocol.h's
+        // DamageReport struct for why.
+        g_remotePeds.SetDamageDetectedCallback([](uint32_t victimPlayerId, float healthDelta, float armourDelta) {
+            g_network.SendDamageReport(victimPlayerId, healthDelta, armourDelta);
+        });
+        g_network.SetDamageReportCallback([](const ao::proto::DamageReport& report) {
+            if (report.victimPlayerId != g_network.LocalPlayerId()) {
+                return; // meant for a different client; we just saw the broadcast echo
+            }
+            g_localPlayer.ApplyDamage(report.healthDelta, report.armourDelta);
+            ao::log::Info("took %.1f hp / %.1f armour damage from player %u",
+                          report.healthDelta, report.armourDelta, report.attackerPlayerId);
+        });
+
         g_overlay.Start();
 
         const std::string cfgPath = paths::GetPluginDirRelativePathA("AndreasOnline.cfg");

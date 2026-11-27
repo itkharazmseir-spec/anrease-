@@ -75,3 +75,481 @@ tracing *callers* of already-confirmed functions (e.g. what calls
 `FindPlayerPed` once per frame, near the top of the call stack) is more
 promising than searching near the old 1.0 addresses, since those turned out
 to be unrelated functions entirely.
+
+---
+
+## 2026-11-26 - `CPopulation::AddPed` search, suspended (PGO)
+
+Needed for step 3 (spawning a real `CPed` for each remote player). The
+`FindPlayerPed`-style technique (xref-count ranking + disassembly-shape
+matching near the 1.0 address' relative position) was tried repeatedly here
+and failed every time - candidate addresses either disassembled to garbage
+or to clearly unrelated functions. One concrete example: forcing Ghidra to
+define a function at `0x00612bc0` (inside a conspicuous ~3184-byte gap in
+Ghidra's own auto-analysis coverage, between two otherwise-normal functions
+at `0x612b40` and `0x6137b0`, sized about right for where `AddPed` should
+sit) decompiled to a 16x16 spatial-grid lookup with frame-rate-scaled timers
+- some kind of proximity/collision query, not ped allocation.
+
+**Root cause (best understanding so far):** this RGL `gta_sa.exe` is very
+likely built with Profile-Guided Optimization. Evidence: the file is ~34MB
+vs ~11MB for 1.0 US despite `get_function_count`/`analysis_status` reporting
+a normal, fully-analyzed function count (20588); several locations disas-
+semble to a `jmp dword ptr [0x0150xxxx]`-style far jump into a completely
+separate ~0x0150xxxx code region, which is the classic signature of a PGO
+build physically splitting a function's "hot" and "cold" basic blocks apart.
+If true, this invalidates the "nearby in 1.0 -> nearby in RGL" address-delta
+heuristic for *this specific neighbourhood* of the binary (it still worked
+for `FindPlayerPed`, which is presumably "hot enough" to not get split, or
+got split in a way that happened not to matter for finding its entry point).
+
+**Checked for an existing answer - none exists:**
+- SilentPatch (github.com/CookiePLMonster/SilentPatch, MIT, open source,
+  explicitly RGL/Steam-compatible via runtime AOB pattern scanning through
+  their ModUtils `hook::pattern`) has **no pattern for `CPopulation::AddPed`**
+  anywhere in its source (confirmed by grep).
+- SA-MP never supported RGL/Steam builds at all.
+- open.mp is a server-only replacement (its own FAQ says so) - no client-side
+  ped-rendering code to borrow from even if it did support this binary.
+
+**Decision:** suspended for now rather than continuing to spend effort on
+manual single-address probing of an ~34MB restructured binary with no
+systematic strategy left to try (the gap-sweep approach does not scale: each
+candidate costs one `create_function` + one decompile + manual read, and the
+binary offers no shortcut for *where* in a multi-KB gap the real function
+starts). Remote players are made visible a different way instead - see
+`ao::Overlay` in `client/include/ao/Overlay.h` / `RGL_COMPAT_NOTES.md`.
+
+**If this is picked up again**, the PGO theory should be confirmed or ruled
+out first (e.g. look for a `.pgo`/profile section in the PE header, or check
+whether MSVC's `/LTCG:PGInstrument`/`/LTCG:PGOptimize` flags are mentioned
+anywhere associated with this specific RGL build online) - if true, a
+function-boundary-based search is the wrong tool entirely, and the right one
+is probably a *data-xref* search instead: find the pool allocator or a known
+constant (e.g. `CPed`'s `sizeof` 0x79C, or a known model-id table) and walk
+backward from its cross-references, since those tend to stay in one place
+even when the calling code around them is split and reordered.
+
+---
+
+## 2026-11-26 (later same day) - `CPopulation::AddPed` FOUND - the above is superseded
+
+The PGO-splitting theory above turned out to be the wrong explanation for
+*why the search kept failing* - the gap region is real, but it contains
+several small, ordinary, previously-unanalysed functions, not one function
+scattered by PGO. The actual mistake was simply probing the wrong
+sub-address inside that gap (`0x612bc0`, which really is an unrelated
+16x16 spatial-grid/proximity query, exactly as decompiled above) rather than
+the right one.
+
+**Found address (this RGL build): `0x612f36`** (note: not `0x612b40`, the
+start of the gap itself - there is a small stub + NOP padding from
+`0x612f24` to `0x612f35` before the real function entry).
+
+**How it was confirmed, all independently cross-checked:**
+1. gta-reversed (`github.com/gta-reversed/gta-reversed`,
+   `source/game_sa/Population.cpp`) gives the exact 1.0 US address,
+   `0x612710`, right before this gap - the first hint the RGL copy lives
+   nearby rather than being unfindable.
+2. Ghidra's `create_function` on `0x612f36` produced one clean, contiguous,
+   1380-byte function - a single entry, a single set of exits. Not what
+   PGO-splitting would produce.
+3. The decompiled body matches the 1.0 US source
+   (`CPopulation::AddPed`) point for point:
+   - `thunk_FUN_014f0e20(0x79c)` -> `operator new(sizeof(CPed)=0x79C)`, the
+     same `CPed` size mentioned above.
+   - the literal `0x61a9` (=25001 decimal) matches the 1.0 source's
+     `GiveAndSetPedWeapon(ped, wtype, /*ammo=*/25001)` default exactly.
+   - `FUN_0056e6b0(0xffffffff)` is a call to the already-verified
+     `FindPlayerPed` address with `playerId=-1`, matching the 1.0 source's
+     `CHEAT_SLUT_MAGNET` branch.
+   - `FUN_00439b00(0,0,0)` matches `SetOrientation(0,0,0)`.
+   - `FUN_005636c0(iVar5)` matches `CWorld::Add(ped)`.
+   - the final `if ((char)param_4 != '\0') { ... }` matches the 1.0 source's
+     `if (!makeWander) return ped;` (same check, inverted).
+4. plugin-sdk's own 1.0 US calling pattern
+   (`plugin_sa/game_sa/CPopulation.cpp:238-241`) confirms the exact ABI:
+   `__cdecl`, `(ePedType, unsigned int, CVector const&, bool) -> CPed*`.
+   Only the address differs between builds.
+
+See `client/include/ao/GameAddrs.h` (`kAddr_AddPed_RGL`,
+`VerifyAddPedFingerprint()`) for the runtime fingerprint and the full
+writeup, and `client/src/RemotePeds.{h,cpp}` for how it is used to spawn and
+update a real `CPed` for every remote player. This is a materially riskier
+call than every previous address in this file: it *allocates into and
+mutates* the game's own global ped pool from a background thread (no
+verified-safe main-thread hook exists for this build - see
+`RGL_COMPAT_NOTES.md`), rather than only reading existing memory. Treat it
+as experimental; it is disclosed as such to the user.
+
+**One remaining limitation, left as a future improvement:** moving an
+already-spawned remote ped writes `GetPosition()`/`m_fHeadingCurrent`
+directly rather than calling `SetPosn()`/`SetOrientation()`/`SetHeading()`
+(plugin-sdk shows those as three *more* separate, unverified raw addresses
+for this build - `0x420B80`/`0x4241C0`/`0x439A80`/`0x43E0C0` for 1.0 US).
+Direct field writes need no new addresses and correctly move the ped's
+collision/position, but do not update the RenderWare rotation matrix used
+for visual facing - a remote ped will stand in the right place but may not
+visually face the right direction until those addresses are found too.
+
+---
+
+## 2026-11-26 (later same day) - `CCarCtrl::CreateCarForScript` FOUND (vehicle sync)
+
+Needed for step 3's "vehicle sync" (a remote player who is driving should
+show up as a real moving vehicle, not a ped floating at the car's position).
+Found using the methodology the AddPed entry above suggests for next time:
+a *data/call-xref* search from an already-verified address, rather than
+guessing nearby addresses from scratch.
+
+**Found address (this RGL build): `0x432000`** (1.0 US: `0x431F80`, per
+gta-reversed `source/game_sa/CarCtrl.cpp` - a striking `0x80`-byte delta,
+the smallest of any address found in this project so far, and the first
+clue this build's copy sits almost exactly where 1.0 put it).
+
+**How it was found:** `CWorld::Add`'s RGL address was already confirmed as
+part of the AddPed investigation above (kept internally as `FUN_005636c0`).
+Listing every caller of that address (`get_functions` with `fields=callers`)
+returned 49 functions - every entity type (objects, peds, vehicles) funnels
+through `CWorld::Add`, so most of the 49 are unrelated, but `FUN_00432000`
+stood out immediately by being close to the 1.0 address of
+`CCarCtrl::CreateCarForScript`.
+
+**How it was confirmed, independently, by decompiled-body matching:**
+- a call to a `CModelInfo::IsBoatModel`-shaped function splits the function
+  into two parallel branches, matching the 1.0 source's
+  `if (CModelInfo::IsBoatModel(modelid))`.
+- the non-boat branch writes the literal float bit-pattern `0x41500000`
+  (=13.0f) and the literal byte `0xD` (=13 decimal) into the vehicle's
+  autopilot fields, matching the 1.0 source's
+  `vehicle->m_autoPilot.m_speed = 13.0F; ...SetCruiseSpeed(13);` exactly.
+- the boat branch instead writes `0x41a00000` (=20.0f) and `0x14` (=20
+  decimal), matching `boat->m_autoPilot.m_speed = 20.0F;
+  ...SetCruiseSpeed(20);` exactly - two independent float+byte constant
+  pairs, in two different branches, both exact matches.
+- both branches call `FUN_005636c0` (the already-verified `CWorld::Add`)
+  on the freshly built vehicle, matching `CWorld::Add(...)` in both of the
+  1.0 source's boat and non-boat paths.
+- plugin-sdk's own 1.0 US declaration (`CCarCtrl.h:49`) confirms the exact
+  signature: `__cdecl`, `(int modelid, CVector posn, unsigned char
+  MissionCleanUpFlag) -> CVehicle*`. Unlike `AddPed`'s `CVector const&`,
+  this one takes the `CVector` **by value** (three separate float stack
+  slots) - the decompiled RGL function's parameter shape
+  (int, float, float, float, char) confirms this was carried over unchanged.
+
+See `client/include/ao/GameAddrs.h` (`kAddr_CreateCarForScript_RGL`,
+`VerifyCreateCarForScriptFingerprint()`) and `client/src/RemotePeds.{h,cpp}`
+(`RemotePedManager`, extended to switch each remote player between a ped and
+a vehicle depending on `PlayerState.vehicleModel`). Same risk profile as
+AddPed: allocates into and mutates the game's own global vehicle pool from
+the background polling thread.
+
+**Chosen behaviour on disconnect/mode-switch, and why:** `CVehicle::m_fHealth`
+exists (plugin-sdk: `0x4C0`, "1000.0f = full health, 0 -> explode"), so
+setting it to 0 to force a despawn - mirroring how disconnected peds are
+handled - was considered and rejected: it would detonate the vehicle (fire,
+explosion sound, wreck) at the exact spot a player disconnected or got out,
+which is a far more jarring, unexpected effect than one extra parked car
+left behind. Instead, a vehicle is simply forgotten (never despawned) when
+its driver disconnects or gets out - it was already created with
+`CreateCarForScript`'s own "locked, abandoned" flags set, so the game
+itself already treats it as an ordinary parked/abandoned vehicle from that
+point on.
+
+## 2026-11-27 - Movement interpolation (smoothing) for remote players/vehicles
+
+Implements item 1 of the "what's left for a fully networked version"
+status report given this session: remote peds and vehicles used to
+teleport directly to each incoming `PlayerState` packet (every
+`kNetSendIntervalMs` = 100ms), which looks like a visible stutter/snap
+instead of smooth motion. No new address or Ghidra work was needed for
+this - it's a pure client-side technique (snapshot interpolation), the
+same one most networked games use to smooth out a low-frequency position
+feed.
+
+**Design:** `RemotePedManager` now keeps two timestamped keyframes per
+remote avatar - `from*` (the previous network update) and `to*` (the
+latest one) - instead of writing position/heading directly on packet
+arrival. `OnNetworkUpdate()` (renamed from `UpdatePed()`) only shifts
+`to*` into `from*` and records the new packet as the new `to*`, stamped
+with the current tick count. A new `Tick()` method, called once per
+`PollThreadProc` loop iteration (every `kPollIntervalMs` = 50ms, i.e.
+twice as often as new packets arrive) computes how far between the two
+keyframes "now" falls and linearly blends position; heading is blended
+with shortest-path wraparound handling (so turning from 350 degrees to 10
+degrees rotates the short way, 20 degrees, not the long way around). A
+mild overshoot allowance (`t` clamped to `[0, 1.5]` rather than `[0, 1]`)
+keeps motion from visibly freezing the instant one packet runs a little
+late, while a hard clamp still prevents a real stall (lag spike,
+disconnect in progress) from flinging the avatar off into the distance.
+`ResetInterpolation()` snaps `from == to == current` right after a fresh
+spawn or a ped/vehicle mode switch, so the very first frame after a
+switch doesn't interpolate from a stale/zeroed keyframe.
+
+Health/armour are still applied immediately in `OnNetworkUpdate()`, not
+interpolated - those aren't continuous motion, so smoothing them would
+only delay a value that's already correct. Vehicle heading is still never
+written at all (position only) - there is no known vehicle-equivalent of
+`CPed::m_fHeadingCurrent` to even attempt, same limitation as before this
+change; see the CreateCarForScript entry above and the "known limitations"
+note in RGL_COMPAT_NOTES.md.
+
+**Risk note:** `Tick()` now writes a ped/vehicle's position roughly twice
+as often as `UpdatePed()` used to (every ~50ms instead of only on packet
+arrival, ~100ms) - a higher *rate* of the same pre-existing
+background-thread write risk already disclosed for AddPed/
+CreateCarForScript above, not a new kind of risk. Every write is still
+SEH-guarded and forgets the pointer (triggering a respawn) rather than
+risking a second fault if the game has freed/recycled it.
+
+See `client/src/RemotePeds.h` (updated `RemoteAvatar` struct, `OnNetworkUpdate`/
+`Tick`/`ResetInterpolation` declarations) and `client/src/RemotePeds.cpp`
+(the blending math) for the implementation, and `client/src/Main.cpp`
+(`PollThreadProc`, the `SetPlayerStateCallback` lambda) for how it's wired
+into the poll loop.
+
+Item 2 from the same status report (real orientation via
+`SetOrientation`/`SetHeading` instead of the inert `m_fHeadingCurrent`
+field write) is still blocked on Ghidra - no instance was running this
+session. One strong lead already in hand for next time: the AddPed
+decompilation (see the entry above) showed a call `FUN_00439b00(0,0,0)`
+matching `SetOrientation(0,0,0)` in the 1.0 source - `0x439b00` may
+already be the correct RGL address for `SetOrientation` and is worth
+fingerprinting/verifying directly rather than re-deriving from scratch.
+
+## 2026-11-27 (later same day) - CPlaceable::SetHeading FOUND (real rotation)
+
+Implements item 2 of the "what's left for a fully networked version" status
+report: real visual rotation for remote peds AND vehicles, replacing the
+old `m_fHeadingCurrent`-only write (which only feeds the ped's own AI
+heading-blend logic and never touched the rendered rotation matrix - a
+known, previously-disclosed limitation in RGL_COMPAT_NOTES.md and the
+AddPed/CreateCarForScript writeups above).
+
+**Found address (this RGL build): `0x43e140`** (1.0 US: `0x43E0C0`, per
+gta-reversed `source/game_sa/Entity/Placeable.cpp` -
+`CPlaceable::SetHeading`). Same `0x80`-byte delta already seen between 1.0
+US and this RGL build for `CCarCtrl::CreateCarForScript` above.
+
+**How it was found - starting from a clue already in hand, not a blind
+search:** the AddPed writeup (see above) had already noted, in passing,
+that AddPed's decompilation contains a call `FUN_00439b00(0,0,0)` matching
+`SetOrientation(0,0,0)` in the 1.0 source. That was followed up first:
+
+1. `0x439b00` was decompiled in full and matched point for point against
+   gta-reversed's `CPlaceable::SetOrientation`:
+   - reads an `int` at object-offset `0x14` and branches on whether it is
+     zero - exactly `m_matrix`'s offset (plugin-sdk:
+     `VALIDATE_OFFSET(CPlaceable, m_matrix, 0x14)`).
+   - the zero branch writes the third argument to offset `0x10` and
+     returns, matching `m_placement.m_fHeading = z; return;` (the no-matrix
+     early-out).
+   - the non-zero branch saves the matrix's position (floats at
+     matrix-offset `0x30`/`0x34`/`0x38`), calls a helper, then adds the
+     saved floats back - matching `CVector vecPos =
+     m_matrix->GetPosition(); m_matrix->SetRotate(x,y,z);
+     m_matrix->GetPosition() += vecPos;` exactly.
+   This confirmed `0x439b00` = `CPlaceable::SetOrientation` for this build
+   (1.0 US: `0x439A80`, delta `0x80` - the same delta already seen for
+   `CreateCarForScript`, which is what made `0x80` worth trying as a
+   general offset for this neighbourhood of the binary).
+2. `SetHeading`'s 1.0 US address (`0x43E0C0`) at the same `+0x80` delta -
+   `0x43e140` - was decompiled next and matched gta-reversed's
+   `CPlaceable::SetHeading` exactly: same offset-`0x14` zero check, same
+   offset-`0x10` write in the zero branch, and the non-zero branch is a
+   single tail `JMP` (not `CALL`) into another small function.
+3. That callee (`0x59b7f0`) was decompiled too and is textbook
+   `CMatrix::SetRotateZOnly`: computes one `cos`/`sin` pair and writes a
+   pure Z-axis rotation (right = `(cos,sin,0)`, up = `(-sin,cos,0)`),
+   zeroing the cross terms - a different, cheaper shape than
+   `SetOrientation`'s general 3-axis `SetRotate`, exactly matching what the
+   name "ZOnly" promises.
+
+**Why `SetHeading`, not `SetOrientation`, is called from
+`RemotePeds.cpp`:** this project only ever tracks a single `headingRad`
+float per remote player (`PlayerState` in
+`shared/include/ao/Protocol.h` has no pitch/roll to send), so the simpler,
+cheaper single-angle function is the right one to call - not a
+mismatch-covering workaround.
+
+**Why one address fixes both peds and vehicles:** plugin-sdk's class
+hierarchy is single, non-virtual inheritance the whole way down for both
+(`CPed : CPhysical : CEntity : CPlaceable`, `CVehicle : CPhysical : CEntity
+: CPlaceable`), so the `CPlaceable` sub-object sits at object offset 0 in
+both - a `CPed*` or a `CVehicle*` is already a valid, unadjusted
+`CPlaceable*` "this" pointer for this `__thiscall` function. This is why
+`client/src/RemotePeds.cpp`'s `SetHeading_RGL()` helper takes a bare
+`void*` rather than a typed pointer: this project's trimmed-down
+`CPed.h`/`CVehicle.h` don't expose the full `CEntity`/`CPhysical`/
+`CPlaceable` chain, and calling through `void*` sidesteps needing those
+types just for this one call.
+
+See `client/include/ao/GameAddrs.h` (`kAddr_SetHeading_RGL`,
+`VerifySetHeadingFingerprint()`, 24-byte fingerprint covering the whole
+function body) and `client/src/RemotePeds.cpp` (`SetHeading_RGL()`, called
+from `Tick()` for both the ped and vehicle branches, right alongside the
+already-existing interpolated position write). `m_fHeadingCurrent` is also
+still written for peds (in addition to the real `SetHeading` call) so the
+game's own AI heading-blend logic, which reads that field elsewhere,
+doesn't fight the next `SetHeading` call by blending away from a stale
+value.
+
+This closes out both items 1 and 2 from this session's "what's left"
+status report.
+
+## Item 4 (Events hooks) - dropped by explicit decision
+
+The user agreed to drop this item. It no longer serves any purpose this
+project needs (the old reason for it was superseded by the Win32 HUD
+overlay long ago) and it would have meant patching live game code, which
+is a strictly higher-risk category of change than anything else here
+(every other hook in this project calls existing game functions through
+their real addresses; patching code means overwriting instructions in a
+running process). Not pursued further, and not planned.
+
+## Item 3 (real player models) - scoped/safe implementation, 2026-11-27
+
+**What was wanted:** make a remote player appear using their own real ped
+skin (whatever model they're using locally - a custom skin, a mission
+outfit, etc.) instead of always spawning them as the same generic
+`MODEL_MALE01` civilian.
+
+**What would have made that fully general, and why it wasn't found:**
+spawning an arbitrary model safely requires checking it is actually loaded
+in memory on the *receiving* player's machine first - plugin-sdk's
+equivalent is `CStreaming::HasModelLoaded`, which isn't really a function
+call at all, just a direct read of a global array,
+`CStreaming::ms_aInfoForModel` (1.0 US address `0x8E4CC0`, confirmed via
+gta-reversed's `Streaming.h`/`StreamingInfo.h`: an array of
+`CStreamingInfo` entries, 20 (`0x14`) bytes each, with the load-state flag
+at struct offset `0x10`). Finding *this* build's real address for that
+global needed a byte-pattern or literal-constant search over Ghidra's
+~15,000 unnamed global data items (to anchor on, e.g., the array's known
+element count or stride) - the specific Ghidra tools for that
+(`search_instructions`/`search_byte_patterns`) were not reachable this
+session despite being reported as loaded on the Ghidra bridge side, and no
+reliable anchor was found through the tools that *were* available
+(`list_data_items_by_xrefs` across all 15,324 items, several targeted
+reads). Spawning an arbitrary, possibly-not-loaded model without that
+check risks a hard crash for the viewer, so this was not attempted. This
+is a documented gap, not a guess - if a working byte-search tool becomes
+available in a future session, this is the next thing to look up.
+
+**What was implemented instead (safe, not a placeholder):** the sender's
+real `CEntity::m_nModelIndex` is now synced over the wire (protocol v2,
+new `pedModel` field on `PlayerState` - see
+`shared/include/ao/Protocol.h`), but a receiving client only ever *acts*
+on it for the two models that are, by construction, guaranteed loaded on
+every single connected client at all times: `MODEL_PLAYER` (0, "CJ", the
+default protagonist model) and `MODEL_CSPLAY` (1, the alternate
+player-select skin). Both are safe because every player's own local ped
+always exists using one of them from the moment the game boots - so
+"is it loaded on the viewer's machine" is always true for these two,
+without needing the streaming check above at all. Any other `pedModel`
+value received falls back to the previous, always-safe default
+(`MODEL_MALE01`, 7) exactly as before. See
+`client/src/RemotePeds.cpp`'s `ResolveRemotePedModel()` for the actual
+two-value allowlist and its full reasoning in the comment above it.
+
+Changed files: `shared/include/ao/Version.h` (protocol bumped 1 → 2 -
+old and new builds will refuse to connect to each other, per the existing
+version-mismatch check already in `server/src/Main.cpp`),
+`shared/include/ao/Protocol.h` (`PlayerState.pedModel`, `int32_t`),
+`client/src/LocalPlayer.h`/`.cpp` (reads `ped->m_nModelIndex` into
+`PlayerSnapshot::pedModel`), `client/src/Main.cpp` (copies it into the
+outgoing `PlayerState`), `client/src/RemotePeds.cpp`
+(`ResolveRemotePedModel()` + `SpawnPed()` uses it). No server source
+changes were needed - `HandlePlayerState` in `server/src/Main.cpp` just
+checks the struct size and rebroadcasts the raw bytes, so a new field is
+handled automatically by the existing generic pass-through logic; only a
+server rebuild (picking up the new struct size/version) is required.
+
+## Item 5 (weapon/damage sync) - completed, 2026-11-27 (continued session)
+
+The user asked for this to be finished, not left as a reported blocker.
+The original plan - detect a real weapon-give/fire call
+(`CPed::GiveWeapon` or equivalent) - hit genuine address-finding walls that
+could not be safely worked around (full investigation kept in
+`docs/RGL_COMPAT_NOTES.md`'s "Item 5" section: a merged/un-splittable
+function blob, one coincidental false-positive address, and an
+unresolvable CFG-style indirect thunk). Rather than guess an address to
+force a "complete" result, the feature was redesigned around data this
+project already trusts completely and uses safely elsewhere:
+`CPed::m_fHealth`/`m_fArmour` are plain data at plugin-sdk-verified
+offsets, not code to call - no RGL-specific address exists for them at all
+(same category as the `m_fHeadingCurrent`/`m_nModelIndex` fields already
+read/written throughout this project).
+
+**The design:** `RemotePedManager::Tick()` (in `client/src/RemotePeds.cpp`)
+now also watches each remote avatar's `CPed::m_fHealth`/`m_fArmour` for a
+drop since the last authoritative `PlayerState` - this is a drop the
+local game engine itself just computed (a bullet, explosion, collision,
+anything the engine's own physics/damage code already processed against
+that locally-spawned stand-in CPed). A new baseline pair
+(`RemoteAvatar::lastKnownHealth/Armour`) tracks what "no new damage yet"
+means, refreshed every time an authoritative `PlayerState` is applied so a
+network update is never itself misread as damage. When a real drop is
+seen, `RemotePedManager`'s new `SetDamageDetectedCallback` fires with
+`(playerId, healthDelta, armourDelta)`; `client/src/Main.cpp` wires that to
+a new `NetworkClient::SendDamageReport()`, which sends a new
+`MessageType::DamageReport` (protocol v3) to the server over the reliable
+channel (unlike `PlayerState`, a damage event must never be silently
+dropped). The server (`server/src/Main.cpp`'s new `HandleDamageReport`)
+overwrites the sender-claimed `attackerPlayerId` with the real sender id
+(same convention as `PlayerState.playerId`), clamps both deltas to
+`[0, 100]` (GTA SA's own health/armour range - bounds a buggy or malicious
+client's claim to "as if hit by the single biggest legitimate hit" rather
+than an unverifiable instant kill), rejects a report naming a
+`victimPlayerId` that isn't currently connected, and broadcasts the result
+to everyone. Every client's `NetworkClient::SetDamageReportCallback`
+ignores a report that doesn't name them as the victim; the one client it
+does name applies it directly to their own real ped via a new
+`LocalPlayer::ApplyDamage(healthDelta, armourDelta)` (clamped to not go
+below 0) - the first write this project makes to the *local* player's own
+ped (previously only reads); same accepted background-thread/game-memory-
+write risk category as every other field write here, just a new target.
+
+**Changed files:** `shared/include/ao/Protocol.h` (`MessageType::DamageReport`
++ `DamageReport` struct), `shared/include/ao/Version.h` (protocol bumped
+2 -> 3 - this is a genuinely new message type, not just a struct field, so
+an old build would not understand it at all, not merely misread it),
+`client/include/ao/NetworkClient.h`/`.cpp` (`SendDamageReport`,
+`SetDamageReportCallback`), `server/src/Main.cpp` (`HandleDamageReport`),
+`client/src/RemotePeds.h`/`.cpp` (baseline fields, drop detection,
+`SetDamageDetectedCallback`; also fixed a small pre-existing gap where a
+freshly-spawned avatar kept the engine's default health/armour until the
+*second* `PlayerState` - now applied immediately on spawn, which the new
+baseline also needed to be correct from the first `Tick()`),
+`client/src/LocalPlayer.h`/`.cpp` (`ApplyDamage`), `client/src/Main.cpp`
+(wires `RemotePedManager`'s damage-detected callback to
+`SendDamageReport`, and `NetworkClient`'s `DamageReport` callback to
+`ApplyDamage`).
+
+**Verification:** compiled clean via the usual mingw sync-check for every
+client file; the server side was verified further than usual, because it
+has new actual logic (not just a pass-through) - built and linked as a
+real, running Linux binary (not just `-fsyntax-only`), then exercised with
+two scripted ENet test clients against that live server process. Confirmed
+in real, observed server output: the server overwrites a forged
+`attackerPlayerId` (sent as `999`) with the real sender's assigned id,
+clamps an out-of-range `healthDelta` (sent as `500`) down to `100`, passes
+an in-range `armourDelta` (`15`) through unchanged, broadcasts the result
+to both the attacker and the victim, and correctly drops a second test
+report naming a `victimPlayerId` (`9999`) that was never connected. This is
+the most thoroughly runtime-tested piece of networking logic in the
+project so far (everything game-memory-related is still Ghidra-static-
+analysis-only and untested in a live game, per the existing disclosure).
+
+**Known, disclosed limitation:** because this reports "this avatar lost
+health/armour" rather than "this avatar was shot with weapon X", it cannot
+distinguish a real PvP hit from any other source of damage the avatar
+takes in the attacker's own local simulation (an explosion, a collision,
+being run over, etc.) - all such events get reported and applied the same
+way. This is treated as a reasonable (arguably more complete)
+interpretation of "damage sync" rather than a bug - see
+`client/src/RemotePeds.h`'s class comment. Vehicle damage is explicitly
+out of scope for this change; only ped health/armour is synced this way.
+
+Everything past items 1-5 on the original "what's left" list (multi-
+passenger vehicles, security/auth, interior tracking, and actual
+multiplayer testing) remains open; item 4 is dropped (see above).

@@ -46,6 +46,7 @@ void LocalPlayer::Update() {
         s.headingRad = ped->m_fHeadingCurrent;
         s.health     = ped->m_fHealth;
         s.armour     = ped->m_fArmour;
+        s.pedModel   = ped->m_nModelIndex;
 
         CVehicle* veh = (ped->bInVehicle && ped->m_pVehicle) ? ped->m_pVehicle : nullptr;
         const CVector& pos = veh ? veh->GetPosition() : ped->GetPosition();
@@ -64,6 +65,29 @@ void LocalPlayer::Update() {
     }
 
     m_snapshot = s;
+}
+
+void LocalPlayer::ApplyDamage(float healthDelta, float armourDelta) {
+    // Same background-thread/direct-game-memory-write risk already disclosed
+    // for every other field write in this project (see RemotePeds.h) - this
+    // just extends that existing, already-accepted risk to the local
+    // player's own ped instead of only a spawned remote one. The SEH guard
+    // turns a crash from a race with the game's own thread into "this
+    // damage application silently failed" rather than taking the game down.
+    __try {
+        CPlayerPed* ped = FindPlayerPed_RGL(-1);
+        if (!ped) return;
+
+        ped->m_fArmour -= armourDelta;
+        if (ped->m_fArmour < 0.0f) ped->m_fArmour = 0.0f;
+
+        ped->m_fHealth -= healthDelta;
+        if (ped->m_fHealth < 0.0f) ped->m_fHealth = 0.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Pointer went stale mid-write; nothing more to do here - the next
+        // successful Update() call picks up whatever the real state is, and
+        // the next PlayerState broadcast carries it to everyone else.
+    }
 }
 
 } // namespace ao

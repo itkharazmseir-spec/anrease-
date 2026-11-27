@@ -13,6 +13,8 @@ inline constexpr const char* kVersionString = AO_VERSION_STRING;
 
 // Network protocol version. Bumped on every incompatible wire-format change.
 // Client and server refuse to talk if this differs (enforced from step 2 on).
-inline constexpr std::uint16_t kProtocolVersion = 1;
+// v3 (2026-11-27): added MessageType::DamageReport + the DamageReport struct
+// (item 5, "weapon/damage sync" - see Protocol.h and docs/MEMORY.md).
+inline constexpr std::uint16_t kProtocolVersion = 3;
 
 } // namespace ao
