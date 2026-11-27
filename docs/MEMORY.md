@@ -642,3 +642,85 @@ needs to rebuild, redeploy, and re-test (ideally again with
 `FakePlayer.exe`, since that is the only way they can currently test with
 a second player) to confirm in the real game whether the crash is actually
 gone.**
+
+---
+
+## 2026-11-27 (later same day) - crash fix v1 did NOT work; v2 (suspend
+## every thread) deployed instead
+
+**First, two separate real MSVC/CI build failures, both fixed:**
+
+1. `error C2712: Cannot use __try in functions that require object
+   unwinding` on both `SpawnPed()`/`SpawnVehicle()`. Cause: the
+   `MainThreadSuspendGuard` object (has a destructor) was declared directly
+   inside the `__try` block wrapping `AddPed_RGL`/`CreateCarForScript_RGL` -
+   MSVC flatly refuses to let `__try`/`__except` share a function with any
+   C++ object that needs destructor unwinding. The mingw sync-check used
+   throughout this project for quick syntax checks does not enforce this
+   MSVC-only rule, which is why it wasn't caught until the user's own real
+   CI build. **Fix:** the `__try`/`__except` itself was moved into two tiny
+   free functions (`TryAddPed_RGL`/`TryCreateCarForScript_RGL` in
+   `client/src/RemotePeds.cpp`) containing only raw pointers/PODs, no C++
+   objects at all; `SpawnPed()`/`SpawnVehicle()` now construct the guard in
+   their own scope and call one of those functions instead of wrapping the
+   raw game call with an inline `__try`/`__except` themselves.
+
+2. **The fix (v1) did not actually stop the crash.** The user rebuilt,
+   redeployed, and re-tested with `FakePlayer.exe` again - the exact same
+   symptom recurred (the real player's client joined, then disconnected
+   again within seconds; same join/leave/reconnect pattern as the original
+   crash report). This means the v1 design's core assumption - that
+   `GetCurrentThreadId()` captured inside the `AndreasOnlineClient`
+   constructor (which runs when the ASI Loader loads this DLL) reliably
+   identifies the game's real main thread - most likely does not hold for
+   however this specific RGL build's loader actually works. This project
+   has already had to work around several other RGL-specific surprises (see
+   `client/src/Main.cpp`'s RGL BUILD NOTICE), so a non-standard loader
+   thread for this build specifically is plausible; it's also possible some
+   other thread besides "the main thread" touches the pool. Either way,
+   suspending one single, assumed thread left the real race open.
+
+**v2 fix, deployed now: `AllThreadsSuspendGuard`** (replacing
+`MainThreadSuspendGuard` entirely in `client/src/MainThreadGuard.h`) makes
+NO assumption at all about which thread is "the" main thread, or how many
+threads might touch the pool. At the moment `SpawnPed()`/`SpawnVehicle()`
+needs to call `AddPed_RGL`/`CreateCarForScript_RGL`, it enumerates every
+thread in the current process via
+`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)` +
+`Thread32First`/`Thread32Next`, and suspends every one of them except the
+thread making the call (our own background polling thread) - still only
+standard Win32 APIs, no RGL-specific game address of any kind. While every
+other thread in the process is suspended, it is simply not possible for
+anything else to be touching the pool concurrently, regardless of which
+thread that would have been - this closes the race without needing to
+correctly guess which thread v1 got wrong. The now-unused main-thread-id
+plumbing (`RemotePedManager::SetMainThreadId`, `m_mainThreadId`,
+`Main.cpp`'s `g_mainThreadId`) was removed rather than left as dead code.
+
+**Changed files (this round):** `client/src/MainThreadGuard.h` (rewritten:
+`AllThreadsSuspendGuard` replaces `MainThreadSuspendGuard`, full revision
+history kept in the file's own comment), `client/src/RemotePeds.cpp` (the
+C2712 fix above, plus `SpawnPed`/`SpawnVehicle` now use
+`AllThreadsSuspendGuard`; `SetMainThreadId` removed), `client/src/RemotePeds.h`
+(`SetMainThreadId`/`m_mainThreadId` removed; class comment updated),
+`client/src/Main.cpp` (`g_mainThreadId` capture and wiring removed).
+
+**Verification:** same method as before - the mingw sync-check compiles
+clean for `MainThreadGuard.h`/`RemotePeds.h`/`.cpp` (including
+`<tlhelp32.h>`, `THREADENTRY32`, and `std::vector<HANDLE>`, none of which
+were used by v1); `Main.cpp`'s change is a pure removal (no new code), so
+no new syntax risk there.
+
+**Residual risk, updated:** same category as v1 (a possible rare deadlock
+if a suspended thread was mid-allocation holding the CRT heap lock when
+suspended), but now spread across every thread in the process instead of
+just one - still judged low in absolute terms (most of a game's other
+threads, e.g. audio/streaming, are idle/sleeping most of the time) but
+honestly higher than v1's number, since more threads are being suspended
+each time. **This is a second genuine attempt, not a guaranteed fix - the
+user needs to rebuild, redeploy, and re-test (again with `FakePlayer.exe`)
+to find out whether this version actually closes the race. If it still
+crashes, the likely next step is a live debugger attached to a reproduction
+to directly observe which thread is actually racing with
+`AddPed`/`CreateCarForScript`, since guessing a third time without that
+data would not be well-grounded.**

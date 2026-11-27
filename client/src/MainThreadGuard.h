@@ -1,6 +1,8 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
+#include <vector>
 
 // Crash fix (2026-11-27): a real, 100%-reproducible crash was confirmed via
 // Windows Event Viewer during user testing with FakePlayer.exe - the moment
@@ -21,17 +23,35 @@
 // per this confirmed crash, does - surface anywhere else in the game's own
 // code, not at the call site itself.
 //
-// MainThreadSuspendGuard closes this specific race WITHOUT needing any new,
-// unverified, RGL-specific game address at all: instead of finding a hook
-// inside the game's code, it suspends the game's own main thread (its id
-// captured once, at plugin load time - see g_mainThreadId in Main.cpp) using
-// only standard, version-independent Win32 thread APIs for the few
-// microseconds the wrapped call takes. While the main thread is suspended it
-// provably cannot be reading or writing the pool at the same time we are, so
-// there is no race during that window - this is a different kind of
-// guarantee than every other mitigation in this project (SEH guards, byte
-// fingerprints), which only make an existing risk survivable/detectable
-// rather than removing it.
+// --- Revision history of this fix (both still here so the reasoning is not
+// lost - only AllThreadsSuspendGuard, the second one, is actually used) ---
+//
+// v1 (first attempt, 2026-11-27 morning): MainThreadSuspendGuard suspended
+// only ONE thread - the game's main thread, identified by capturing
+// GetCurrentThreadId() once inside the AndreasOnlineClient constructor in
+// Main.cpp, relying on the assumption that the ASI Loader loads a plugin's
+// global constructor synchronously on the game's real main thread. Real
+// user re-testing after this was deployed showed the EXACT same crash
+// pattern recurring (player joins, game crashes/disconnects within
+// seconds) - meaning that assumption was most likely wrong for however
+// this specific RGL build's loader actually works (this project has
+// already had to work around several other RGL-specific surprises - see
+// Main.cpp's RGL BUILD NOTICE - so a non-standard loader thread is
+// plausible here too), or some OTHER thread besides "the main thread" is
+// also touching the ped/vehicle pool. Either way, "suspend the one thread
+// we assumed was the main thread" left the real race open.
+//
+// v2 (this version, 2026-11-27, same day): AllThreadsSuspendGuard makes NO
+// assumption at all about which thread is "the" main thread, or how many
+// threads might touch the pool. It suspends EVERY thread in this process
+// except the one calling it (our own background polling thread), using
+// CreateToolhelp32Snapshot/Thread32First/Thread32Next to enumerate them by
+// process id at the moment of the call - a different, standard Win32
+// technique, still no RGL-specific game address of any kind. While every
+// other thread in the process is suspended, it is simply not possible for
+// anything else to be touching the pool concurrently, regardless of which
+// thread that would have been - this closes the race without needing to
+// correctly guess which thread the v1 approach got wrong.
 //
 // Scope this as tightly as possible: wrap ONLY the AddPed_RGL/
 // CreateCarForScript_RGL call itself (see RemotePeds.cpp's SpawnPed/
@@ -42,62 +62,81 @@
 // already-valid object's own fields rather than pool/list structure, are
 // lower severity (per RemotePeds.h's existing risk disclosure), and happen
 // far more often (every ~50ms per remote avatar) - wrapping those too would
-// mean freezing the game's main thread dozens of times a second per remote
+// mean freezing the entire game process dozens of times a second per remote
 // player, for a much smaller safety benefit than the one-time spawn calls.
 //
-// Residual risk, disclosed rather than hidden: if the main thread happens to
-// be suspended mid-way through its own call into a Windows CRT/heap lock
-// (e.g. mid-malloc/mid-free) that our own wrapped call then also needs (both
-// AddPed and CreateCarForScript allocate), this deadlocks instead of
-// crashing - the heap lock is only held for the brief duration of an actual
-// allocation, so this is rare, but it is not zero. A deadlock hangs the game
-// (visible immediately, recoverable via Task Manager) rather than silently
-// corrupting memory and crashing somewhere unrelated later - judged an
-// acceptable trade against a currently 100%-reproducible crash, but this is
-// a mitigation based on a real, well-precedented technique (suspend-inject-
-// resume, used by various instrumentation/profiling tools for the same
-// reason), not a mathematically proven fix. Real-world re-testing (ideally
-// again with FakePlayer.exe) is what actually confirms whether it works.
+// Residual risk, disclosed rather than hidden: if any of the suspended
+// threads happens to be paused mid-way through its own call into a Windows
+// CRT/heap lock (e.g. mid-malloc/mid-free) that our own wrapped call then
+// also needs (both AddPed and CreateCarForScript allocate), this deadlocks
+// instead of crashing. Suspending MORE threads than v1 did means slightly
+// more chances one of them is mid-allocation at the exact suspend instant,
+// but each individual chance is still small (the heap lock is only held for
+// the brief duration of an actual allocation) and most of a game's other
+// threads (audio, streaming, etc.) are idle/sleeping most of the time. A
+// deadlock hangs the game (visible immediately, recoverable via Task
+// Manager) rather than silently corrupting memory and crashing somewhere
+// unrelated later - judged an acceptable trade against a currently
+// 100%-reproducible crash, but this is still a mitigation based on a real,
+// well-precedented technique (suspend-inject-resume, used by various
+// instrumentation/profiling/garbage-collection tools for exactly this
+// "stop the world" reason), not a mathematically proven fix. Real-world
+// re-testing (ideally again with FakePlayer.exe) is what actually confirms
+// whether THIS version works.
 namespace ao {
 
-class MainThreadSuspendGuard {
+class AllThreadsSuspendGuard {
 public:
-    // mainThreadId: the game's real main thread id, captured once via
-    // GetCurrentThreadId() inside the AndreasOnlineClient constructor in
-    // Main.cpp - which, per the ASI Loader's standard, well-documented
-    // convention (true for every GTA .asi loader, independent of this RGL
-    // build's own unverified addresses), runs synchronously on the game's
-    // real main thread while the .asi is being loaded during the game's own
-    // startup. 0 means "not yet captured" (should not normally happen, since
-    // Main.cpp sets it before starting the polling thread that is the only
-    // caller of this class) - treated the same as "unknown", below.
-    explicit MainThreadSuspendGuard(DWORD mainThreadId) {
-        // Never suspend ourselves (would deadlock immediately, not just
-        // rarely), and do nothing at all if the id is unknown - calling the
-        // wrapped function unprotected is exactly today's existing,
-        // already-disclosed risk, not a new one, so there is nothing worse
-        // to fall back to here.
-        if (mainThreadId == 0 || mainThreadId == GetCurrentThreadId()) {
+    AllThreadsSuspendGuard() {
+        const DWORD selfThreadId = GetCurrentThreadId();
+        const DWORD pid = GetCurrentProcessId();
+
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            // Can't enumerate threads at all - fall back to doing nothing,
+            // same as "id unknown" in v1. Calling the wrapped function
+            // unprotected is exactly the pre-existing, already-disclosed
+            // risk, not a new one, so there is nothing worse to fall back
+            // to here.
             return;
         }
-        m_handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE, mainThreadId);
-        if (m_handle) {
-            SuspendThread(m_handle);
+
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+
+        if (Thread32First(snapshot, &entry)) {
+            do {
+                // th32OwnerProcessID is present on every real THREADENTRY32
+                // this API returns; the dwSize check is defensive, matching
+                // Microsoft's own documented usage pattern for this struct.
+                if (entry.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(entry.th32OwnerProcessID))) {
+                    if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != selfThreadId) {
+                        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+                        if (h) {
+                            SuspendThread(h);
+                            m_handles.push_back(h);
+                        }
+                    }
+                }
+                entry.dwSize = sizeof(entry);
+            } while (Thread32Next(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+    }
+
+    ~AllThreadsSuspendGuard() {
+        for (HANDLE h : m_handles) {
+            ResumeThread(h);
+            CloseHandle(h);
         }
     }
 
-    ~MainThreadSuspendGuard() {
-        if (m_handle) {
-            ResumeThread(m_handle);
-            CloseHandle(m_handle);
-        }
-    }
-
-    MainThreadSuspendGuard(const MainThreadSuspendGuard&) = delete;
-    MainThreadSuspendGuard& operator=(const MainThreadSuspendGuard&) = delete;
+    AllThreadsSuspendGuard(const AllThreadsSuspendGuard&) = delete;
+    AllThreadsSuspendGuard& operator=(const AllThreadsSuspendGuard&) = delete;
 
 private:
-    HANDLE m_handle = nullptr;
+    std::vector<HANDLE> m_handles;
 };
 
 } // namespace ao

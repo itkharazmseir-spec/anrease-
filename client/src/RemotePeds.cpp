@@ -136,12 +136,13 @@ CVehicle* CreateCarForScript_RGL(int modelId, const CVector& pos, unsigned char 
 // Crash fix (2026-11-27) follow-up, real MSVC build failure: error C2712
 // ("Cannot use __try in functions that require object unwinding") - a
 // __try/__except block cannot share a function with any C++ object that has
-// a non-trivial destructor, such as MainThreadSuspendGuard. The mingw
-// sync-check used elsewhere in this project does not enforce this MSVC-only
-// rule, which is why it wasn't caught until a real CI/MSVC build. The two
-// free functions below hold ONLY the __try/__except (no C++ objects of any
-// kind - raw pointers/PODs only, so this is safe); SpawnPed()/SpawnVehicle()
-// now construct MainThreadSuspendGuard in their own scope and call one of
+// a non-trivial destructor, such as AllThreadsSuspendGuard (MainThreadGuard.h).
+// The mingw sync-check used elsewhere in this project does not enforce this
+// MSVC-only rule, which is why it wasn't caught until a real CI/MSVC build.
+// The two free functions below hold ONLY the __try/__except (no C++ objects
+// of any kind - raw pointers/PODs only, so this is safe); SpawnPed()/
+// SpawnVehicle() now construct AllThreadsSuspendGuard in their own scope and
+// call one of
 // these instead of wrapping the raw AddPed_RGL/CreateCarForScript_RGL call
 // with an inline __try/__except themselves.
 CPed* TryAddPed_RGL(ePedType pedType, unsigned int modelIndex, const CVector& pos, bool makeWander) {
@@ -177,17 +178,19 @@ CPed* RemotePedManager::SpawnPed(const proto::PlayerState& state) {
     CPed* ped = nullptr;
 
     // See RemotePeds.h for the full risk disclosure, and MainThreadGuard.h
-    // for the crash-fix design: MainThreadSuspendGuard briefly suspends the
-    // game's real main thread for just this one call, so there is provably
-    // no other thread touching the pool while we insert into it - this is
-    // what actually closes the race a real, confirmed crash exposed (see
-    // MainThreadGuard.h). The __try/__except itself lives inside
-    // TryAddPed_RGL (see above) rather than here, because a __try/__except
-    // cannot share a function with a C++ object that has a destructor, like
-    // this guard (MSVC error C2712 - a real build failure this caused the
-    // first time this was compiled with real MSVC, not just mingw).
+    // for the crash-fix design/revision history: AllThreadsSuspendGuard
+    // suspends every OTHER thread in the process for just this one call, so
+    // there is provably nothing else touching the pool while we insert into
+    // it - this is what actually closes the race a real, confirmed crash
+    // exposed (see MainThreadGuard.h; a first attempt that suspended only
+    // one assumed "main" thread did not actually fix it in real testing).
+    // The __try/__except itself lives inside TryAddPed_RGL (see above)
+    // rather than here, because a __try/__except cannot share a function
+    // with a C++ object that has a destructor, like this guard (MSVC error
+    // C2712 - a real build failure this caused the first time this was
+    // compiled with real MSVC, not just mingw).
     {
-        MainThreadSuspendGuard mainThreadGuard(m_mainThreadId);
+        AllThreadsSuspendGuard suspendGuard;
         ped = TryAddPed_RGL(PED_TYPE_CIVMALE, ResolveRemotePedModel(state.pedModel),
                             CVector(state.x, state.y, state.z),
                             /*makeWander=*/false);
@@ -196,8 +199,8 @@ CPed* RemotePedManager::SpawnPed(const proto::PlayerState& state) {
     if (!ped) {
         log::Error("RemotePedManager: AddPed returned null (or crashed and "
                    "was caught) for player %u - fingerprint mismatch, out of "
-                   "pool slots, or the race this project's main-thread "
-                   "suspend guard is meant to close still occurred", state.playerId);
+                   "pool slots, or the race this project's thread-suspend "
+                   "guard is meant to close still occurred", state.playerId);
         return nullptr;
     }
 
@@ -213,7 +216,7 @@ CVehicle* RemotePedManager::SpawnVehicle(const proto::PlayerState& state) {
     // MainThreadGuard.h. Same C2712 reason for calling through
     // TryCreateCarForScript_RGL instead of an inline __try/__except here.
     {
-        MainThreadSuspendGuard mainThreadGuard(m_mainThreadId);
+        AllThreadsSuspendGuard suspendGuard;
         veh = TryCreateCarForScript_RGL(state.vehicleModel,
                                         CVector(state.x, state.y, state.z),
                                         /*doMissionCleanup=*/0);
@@ -438,10 +441,6 @@ void RemotePedManager::Tick() {
 
 void RemotePedManager::SetDamageDetectedCallback(std::function<void(uint32_t, float, float)> cb) {
     m_damageDetectedCallback = std::move(cb);
-}
-
-void RemotePedManager::SetMainThreadId(unsigned long mainThreadId) {
-    m_mainThreadId = mainThreadId;
 }
 
 void RemotePedManager::MarkDisconnected(uint32_t playerId) {

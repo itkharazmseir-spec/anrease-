@@ -101,13 +101,16 @@ struct CVector;
 // described in the risk disclosure two paragraphs up, and a real crash
 // caused by exactly that race was confirmed via Windows Event Viewer during
 // user testing (gta_sa.exe itself, access violation 0xc0000005, fault offset
-// 0x001e4e00). They are now wrapped in a MainThreadSuspendGuard (see
-// MainThreadGuard.h for the full design and its own, different, honestly-
-// disclosed residual risk) that briefly suspends the game's real main
-// thread - identified once by its thread id, set via SetMainThreadId() below
-// - for just the duration of that one call. SetHeading_RGL and the routine
-// per-tick field writes are deliberately NOT wrapped - see MainThreadGuard.h
-// for why.
+// 0x001e4e00). A first mitigation attempt (suspending only one thread
+// assumed to be the game's main thread) did NOT actually stop the crash in
+// real re-testing - see MainThreadGuard.h's revision history for why that
+// assumption likely didn't hold for this RGL build. The two calls are now
+// wrapped in an AllThreadsSuspendGuard instead (see MainThreadGuard.h for
+// the full design and its own, different, honestly-disclosed residual
+// risk), which suspends every OTHER thread in the process - no "which
+// thread is the main one" guess required at all - for just the duration of
+// that one call. SetHeading_RGL and the routine per-tick field writes are
+// deliberately NOT wrapped - see MainThreadGuard.h for why.
 namespace ao {
 
 class RemotePedManager {
@@ -148,21 +151,6 @@ public:
     // set.
     void SetDamageDetectedCallback(std::function<void(uint32_t playerId, float healthDelta, float armourDelta)> cb);
 
-    // Crash fix (2026-11-27, see the class comment above): the game's real
-    // main thread id, captured once in Main.cpp via GetCurrentThreadId() at
-    // plugin load time. Must be set before the first PlayerState that would
-    // trigger a spawn - there is no re-check/refresh of it afterwards, since
-    // a process's main thread never changes identity for the life of the
-    // process. 0 (the default, if this is never called) means
-    // MainThreadSuspendGuard does nothing, i.e. the pre-existing, already-
-    // disclosed unprotected behaviour - not a new failure mode.
-    //
-    // DWORD is typedef'd as unsigned long on Windows; declared that way here
-    // (rather than DWORD) so this header does not need to pull in
-    // <windows.h> just for this one declaration, consistent with the rest of
-    // this header's style.
-    void SetMainThreadId(unsigned long mainThreadId);
-
 private:
     struct RemoteAvatar {
         CPed*     ped     = nullptr; // non-null while on foot
@@ -196,7 +184,6 @@ private:
 
     std::unordered_map<uint32_t, RemoteAvatar> m_avatars; // playerId -> current avatar
     std::function<void(uint32_t, float, float)> m_damageDetectedCallback;
-    unsigned long m_mainThreadId = 0; // see SetMainThreadId() above
 };
 
 } // namespace ao
