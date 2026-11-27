@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Andreas Online - Store</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Andreas Online <span class="subtitle">Store</span></h1>
+    <div id="account-bar" class="hidden">
+      Logged in as <strong id="account-username"></strong> (account #<span id="account-id"></span>)
+      <button id="logout-btn">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-section">
+      <h2>Log in with your game account</h2>
+      <p class="hint">
+        Use the same <code>account_user</code> / <code>account_password</code> you set in your
+        <code>AndreasOnline.cfg</code>. If you've never set those, connect to the game once with
+        them set, then come back here.
+      </p>
+      <form id="login-form">
+        <label>Username <input type="text" id="login-username" autocomplete="username" required></label>
+        <label>Password <input type="password" id="login-password" autocomplete="current-password" required></label>
+        <button type="submit">Log in</button>
+      </form>
+      <p id="login-error" class="error hidden"></p>
+    </section>
+
+    <section id="catalog-section" class="hidden">
+      <h2>Catalog</h2>
+      <p class="hint">
+        This is a free test catalog - no real payment happens here. Buying an item queues it for
+        delivery next time the game server's purchase-poll runs (every ~2s), and it only arrives if
+        you're currently connected and playing.
+      </p>
+      <div id="catalog-grid"></div>
+      <p id="purchase-message" class="hidden"></p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
