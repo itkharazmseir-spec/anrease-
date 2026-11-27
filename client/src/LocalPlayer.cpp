@@ -3,11 +3,87 @@
 #include "ao/GameAddrs.h"
 #include "CPlayerPed.h"
 #include "CVehicle.h"
+#include "CWeapon.h"
+#include "eWeaponType.h"
 // CGame.h intentionally not included: CGame::currArea is not safe on this
 // build (see GameAddrs.h and LocalPlayer.h) and nothing else here needs it.
 
 namespace ao {
 namespace {
+
+// Item 6 ("weapon give", 2026-11-27): eWeaponType -> CPed::m_aWeapons[]
+// slot index (0-12). This is NOT reverse-engineered from this binary - it
+// is GTA San Andreas's own, publicly documented weapon.dat slot assignment,
+// identical across every copy/version of the game since it's game-design
+// data, not compiled code (same category of "already public, not this
+// project's own discovery" as the eWeaponType enum values themselves,
+// which also come straight from plugin-sdk). Returns -1 for a type that
+// isn't a real carriable weapon (e.g. WEAPONTYPE_ARMOUR is a pickup, not a
+// weapon slot) or isn't in this table yet.
+int WeaponSlotFor(eWeaponType weaponType) {
+    switch (weaponType) {
+        case WEAPONTYPE_UNARMED:
+            return 0;
+        case WEAPONTYPE_BRASSKNUCKLE:
+        case WEAPONTYPE_GOLFCLUB:
+        case WEAPONTYPE_NIGHTSTICK:
+        case WEAPONTYPE_KNIFE:
+        case WEAPONTYPE_BASEBALLBAT:
+        case WEAPONTYPE_SHOVEL:
+        case WEAPONTYPE_POOLCUE:
+        case WEAPONTYPE_KATANA:
+        case WEAPONTYPE_CHAINSAW:
+        case WEAPONTYPE_DILDO1:
+        case WEAPONTYPE_DILDO2:
+        case WEAPONTYPE_VIBE1:
+        case WEAPONTYPE_VIBE2:
+        case WEAPONTYPE_FLOWERS:
+        case WEAPONTYPE_CANE:
+            return 1;
+        case WEAPONTYPE_PISTOL:
+        case WEAPONTYPE_PISTOL_SILENCED:
+        case WEAPONTYPE_DESERT_EAGLE:
+            return 2;
+        case WEAPONTYPE_SHOTGUN:
+        case WEAPONTYPE_SAWNOFF:
+        case WEAPONTYPE_SPAS12:
+            return 3;
+        case WEAPONTYPE_MICRO_UZI:
+        case WEAPONTYPE_MP5:
+        case WEAPONTYPE_TEC9:
+            return 4;
+        case WEAPONTYPE_AK47:
+        case WEAPONTYPE_M4:
+            return 5;
+        case WEAPONTYPE_COUNTRYRIFLE:
+        case WEAPONTYPE_SNIPERRIFLE:
+            return 6;
+        case WEAPONTYPE_RLAUNCHER:
+        case WEAPONTYPE_RLAUNCHER_HS:
+        case WEAPONTYPE_FTHROWER:
+        case WEAPONTYPE_MINIGUN:
+            return 7;
+        case WEAPONTYPE_GRENADE:
+        case WEAPONTYPE_TEARGAS:
+        case WEAPONTYPE_MOLOTOV:
+        case WEAPONTYPE_FREEFALL_BOMB:
+            return 8;
+        case WEAPONTYPE_SATCHEL_CHARGE:
+            return 9;
+        case WEAPONTYPE_DETONATOR:
+            return 10;
+        case WEAPONTYPE_SPRAYCAN:
+        case WEAPONTYPE_EXTINGUISHER:
+        case WEAPONTYPE_CAMERA:
+            return 11;
+        case WEAPONTYPE_NIGHTVISION:
+        case WEAPONTYPE_INFRARED:
+        case WEAPONTYPE_PARACHUTE:
+            return 12;
+        default:
+            return -1;
+    }
+}
 
 // The game's own FindPlayerPed, called directly because plugin-sdk's
 // wrapper does not recognise this exe (see GameAddrs.h). __cdecl matches
@@ -87,6 +163,42 @@ void LocalPlayer::ApplyDamage(float healthDelta, float armourDelta) {
         // Pointer went stale mid-write; nothing more to do here - the next
         // successful Update() call picks up whatever the real state is, and
         // the next PlayerState broadcast carries it to everyone else.
+    }
+}
+
+bool LocalPlayer::GiveWeapon(eWeaponType weaponType, uint32_t ammo) {
+    const int slot = WeaponSlotFor(weaponType);
+    if (slot < 0) return false;
+
+    __try {
+        CPlayerPed* ped = FindPlayerPed_RGL(-1);
+        if (!ped) return false;
+
+        // Direct struct write into CPed::m_aWeapons[slot] (plugin-sdk
+        // VALIDATE_OFFSET(CPed, m_aWeapons, 0x5A0), CWeapon size 0x1C) -
+        // deliberately does NOT call the game's own GiveWeapon(), which is
+        // protected by a code-virtualization layer in this RGL build (see
+        // docs/MEMORY.md). m_pFxSystem is intentionally left untouched (not
+        // zeroed, not freed) - if this slot previously held a weapon with
+        // an active particle system (flamethrower/spraycan/extinguisher,
+        // slots 7/11) this is a known, disclosed gap (see docs/MEMORY.md);
+        // the realistic store weapon list (pistols/rifles/etc.) never hits
+        // those slots, so this is not expected to come up in practice yet.
+        CWeapon& w = ped->m_aWeapons[slot];
+        w.m_eWeaponType = weaponType;
+        w.m_nState = WEAPONSTATE_READY;
+        // No per-weapon clip-size table exists yet (would need CWeaponInfo
+        // data - see docs/MEMORY.md) - both fields are simply set to the
+        // requested ammo count, same simplification many existing SA
+        // trainers/mods use. Functional (the weapon fires normally and
+        // reloads when the clip empties) even though the displayed clip
+        // count can be larger than the weapon's "real" clip size.
+        w.m_nAmmoInClip = ammo;
+        w.m_nAmmoTotal = ammo;
+        w.m_nTimeForNextShot = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 

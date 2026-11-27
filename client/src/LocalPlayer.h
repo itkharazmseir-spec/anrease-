@@ -1,5 +1,11 @@
 #pragma once
 
+#include <cstdint>
+
+enum eWeaponType : unsigned int; // see plugin-sdk's game_sa/enums/eWeaponType.h -
+                                   // forward-declared here so this header doesn't
+                                   // need to pull in the weapon headers itself.
+
 // Reads the local player's state from game memory once per frame and keeps a
 // plain-data copy. Nothing outside this file touches CPed/CVehicle directly
 // for the local player - in step 2 this snapshot is what gets serialised and
@@ -40,6 +46,20 @@ public:
     // thing new here is that it targets the LOCAL player's own ped instead
     // of only a spawned remote one.
     void ApplyDamage(float healthDelta, float armourDelta);
+
+    // Item 6 ("weapon give", 2026-11-27): gives the local player's own real
+    // CPed a weapon by writing directly into its CPed::m_aWeapons[13] array
+    // (plugin-sdk-verified offset/layout - pure data, same trust level as
+    // m_fHealth/m_fArmour above, not a reverse-engineered code address) -
+    // see RemotePeds.h's class comment and docs/MEMORY.md for why this
+    // exists instead of calling the game's own GiveWeapon function (that
+    // function is itself protected by a code-virtualization layer in this
+    // RGL build and cannot be called directly - see docs/MEMORY.md's
+    // "weapon give (direct struct write)" writeup for the full
+    // investigation). Returns false (does nothing) if weaponType has no
+    // known inventory slot (e.g. WEAPONTYPE_ARMOUR, which is a pickup, not
+    // a carriable weapon) or if there is currently no local player ped.
+    bool GiveWeapon(eWeaponType weaponType, uint32_t ammo);
 
     const PlayerSnapshot& Snapshot() const { return m_snapshot; }
 
