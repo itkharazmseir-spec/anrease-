@@ -39,10 +39,23 @@ enum class MessageType : uint8_t {
     DamageReport = 7, // client -> server, then server -> client (broadcast;
                        // added protocol v3, 2026-11-27 - see DamageReport
                        // struct below and docs/MEMORY.md for the full design)
+    PurchaseDelivery = 8, // server -> client only (never sent by a client -
+                       // a client sending this is ignored by the server,
+                       // see HandlePacket). Added protocol v5, 2026-11-27 -
+                       // see PurchaseDelivery struct below and
+                       // docs/MEMORY.md for the full design.
 };
 
 constexpr uint32_t kMaxNameLen = 24; // includes room for a null terminator
 constexpr uint32_t kMaxChatLen = 128;
+
+// Account system (protocol v4, 2026-11-27) - see docs/MEMORY.md for the full
+// design/rationale. kMaxAccountUserLen includes room for a null terminator,
+// same convention as kMaxNameLen.
+constexpr uint32_t kMaxAccountUserLen = 32;
+constexpr uint32_t kAccountHashLen    = 32; // raw SHA-256 digest bytes (see
+                                             // Sha256.h) - NOT hex, the wire
+                                             // format carries raw bytes
 
 #pragma pack(push, 1)
 
@@ -52,17 +65,40 @@ struct Handshake {
     char     playerName[kMaxNameLen]; // not guaranteed null-terminated by
                                        // the sender; a reader must clamp
                                        // before treating it as a C string
+
+    // Account system (protocol v4, 2026-11-27): both empty/zeroed means "no
+    // account" - the connection proceeds exactly as before (anonymous,
+    // accountId 0 in the ack below), for backward-compatible testing tools
+    // (e.g. FakePlayer.exe) that don't care about persistent identity. When
+    // accountUser is non-empty, accountPasswordHash must be the SHA-256
+    // digest of the account's password, computed by the SENDER (see
+    // Sha256.h) - the real plaintext password is never put on the wire. See
+    // Sha256.h's own comment for the current (disclosed, to-be-improved)
+    // lack of a per-account salt.
+    char    accountUser[kMaxAccountUserLen]; // not guaranteed null-terminated
+    uint8_t accountPasswordHash[kAccountHashLen];
 };
 
 enum class HandshakeResult : uint8_t {
     Accepted         = 0,
     ProtocolMismatch = 1,
     ServerFull       = 2,
+    AuthFailed       = 3, // accountUser existed but accountPasswordHash did
+                           // not match the stored one (protocol v4)
 };
 
 struct HandshakeAck {
     HandshakeResult result;
-    uint32_t        assignedPlayerId; // only meaningful if result == Accepted
+    uint32_t        assignedPlayerId; // only meaningful if result == Accepted;
+                                       // per-CONNECTION id, resets every time
+    uint32_t        accountId;        // 0 if this connection is anonymous (no
+                                       // accountUser given); otherwise the
+                                       // PERSISTENT id tied to that username,
+                                       // the same every time that account
+                                       // logs in - this is what a future
+                                       // website/store would use to know
+                                       // which online player to deliver a
+                                       // purchase to (protocol v4)
 };
 
 struct PlayerJoined {
@@ -132,6 +168,33 @@ struct DamageReport {
                                 // buggy/malicious sender can't claim damage
                                 // bigger than the biggest legitimate hit
     float    armourDelta;      // same idea, for CPed::m_fArmour
+};
+
+// Item 7 ("store/purchase delivery", protocol v5, 2026-11-27): how a future
+// website/store tells a currently-connected client "you just bought
+// something, here it is". The server never invents one of these itself -
+// it only relays one it read from its own accounts/purchase queue (see
+// docs/MEMORY.md for the current, deliberately simple flat-file design,
+// "purchases.txt") to whichever connected player's accountId matches. A
+// client receiving this checks accountId against NetworkClient::
+// LocalAccountId() itself (not just trusting that the server addressed it
+// correctly) before acting on it - see client/src/Main.cpp.
+enum class PurchaseItemKind : uint8_t {
+    Vehicle = 0, // itemId is a vehicle model id (same range/meaning as
+                  // PlayerState.vehicleModel); amount is unused (0)
+    Weapon  = 1, // itemId is an eWeaponType value; amount is the ammo count
+                  // given - see LocalPlayer::GiveWeapon()
+};
+
+struct PurchaseDelivery {
+    uint32_t         accountId; // the PERSISTENT account id this purchase is
+                                 // for (see HandshakeAck.accountId) - never 0
+                                 // (an anonymous connection cannot receive a
+                                 // purchase, since there's nothing stable to
+                                 // address it to across reconnects)
+    PurchaseItemKind itemKind;
+    int32_t          itemId;
+    uint32_t         amount;
 };
 
 #pragma pack(pop)

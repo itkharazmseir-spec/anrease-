@@ -106,7 +106,10 @@
 #include "NetworkConfig.h"
 #include "RemotePeds.h"
 
+#include "eWeaponType.h"
+
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <windows.h>
 
@@ -238,6 +241,38 @@ public:
         // to the overlay's chat log. Both callbacks must be set before
         // Start()/the polling thread begins.
         g_overlay.SetSendCallback([](const std::string& text) {
+            // Item 6 ("weapon give", 2026-11-27): "/giveweapon <id> <ammo>"
+            // is a LOCAL-ONLY test command, never sent to the server or any
+            // other client - it calls LocalPlayer::GiveWeapon() directly on
+            // our own real ped (see LocalPlayer.h/.cpp and docs/MEMORY.md).
+            // <id> is an eWeaponType numeric value (e.g. 0x1E = AK47, 0x16 =
+            // Pistol - see plugin-sdk's game_sa/enums/eWeaponType.h for the
+            // full list). This exists purely to test the direct-struct-
+            // write weapon-give mechanism before it is wired to the planned
+            // store/purchase feature - see docs/MEMORY.md.
+            if (text.rfind("/giveweapon", 0) == 0) {
+                // %i (not %u) so "0x1E" parses as hex and a plain "30"
+                // still parses as decimal - most people will copy weapon
+                // ids in hex straight out of eWeaponType.h.
+                int weaponId = 0;
+                int ammo = 100;
+                const int parsed = std::sscanf(text.c_str(), "/giveweapon %i %i", &weaponId, &ammo);
+                if (parsed >= 1) {
+                    const bool ok = g_localPlayer.GiveWeapon(
+                        static_cast<eWeaponType>(static_cast<unsigned int>(weaponId)),
+                        static_cast<uint32_t>(ammo));
+                    char line[160];
+                    std::snprintf(line, sizeof(line),
+                                  ok ? "[local] gave weapon 0x%X x%u ammo"
+                                     : "[local] FAILED to give weapon 0x%X "
+                                       "(no slot for this id, or no local ped)",
+                                  weaponId, ammo);
+                    g_overlay.AddChatLine(line);
+                } else {
+                    g_overlay.AddChatLine("[local] usage: /giveweapon <idHexOrDec> [ammo]");
+                }
+                return;
+            }
             g_network.SendChatMessage(text);
         });
         g_network.SetChatCallback([](uint32_t playerId, const std::string& text) {
@@ -305,14 +340,49 @@ public:
                           report.healthDelta, report.armourDelta, report.attackerPlayerId);
         });
 
+        // Item 7 ("store/purchase delivery", 2026-11-27): the server only
+        // ever sends this addressed to a specific accountId (see
+        // server/src/Main.cpp's PollPurchaseQueue) - still re-check it here
+        // rather than trusting the server alone, since LocalAccountId() is
+        // the one piece of ground truth this client actually has for "is
+        // this purchase really mine". A purchase for an anonymous
+        // connection (LocalAccountId() == 0) can never match, since
+        // accountId 0 is never sent by the server either - see Protocol.h.
+        g_network.SetPurchaseDeliveryCallback([](const ao::proto::PurchaseDelivery& delivery) {
+            if (delivery.accountId == 0 || delivery.accountId != g_network.LocalAccountId()) {
+                return; // not for us
+            }
+            const auto& snap = g_localPlayer.Snapshot();
+            if (!snap.valid) {
+                ao::log::Error("PurchaseDelivery arrived but there's no local player ped "
+                               "right now (main menu/loading?) - item lost: itemKind %d, "
+                               "itemId %d, amount %u",
+                               (int)delivery.itemKind, delivery.itemId, delivery.amount);
+                return;
+            }
+            if (delivery.itemKind == ao::proto::PurchaseItemKind::Vehicle) {
+                const bool ok = g_remotePeds.SpawnStandaloneVehicle(delivery.itemId, snap.x, snap.y, snap.z);
+                ao::log::Info("store delivery: vehicle model %d %s", delivery.itemId,
+                              ok ? "spawned at your position" : "FAILED to spawn");
+            } else if (delivery.itemKind == ao::proto::PurchaseItemKind::Weapon) {
+                const bool ok = g_localPlayer.GiveWeapon(
+                    static_cast<eWeaponType>(static_cast<unsigned int>(delivery.itemId)),
+                    delivery.amount);
+                ao::log::Info("store delivery: weapon 0x%X x%u ammo %s", delivery.itemId,
+                              delivery.amount, ok ? "given" : "FAILED (no slot for this id?)");
+            }
+        });
+
         g_overlay.Start();
 
         const std::string cfgPath = paths::GetPluginDirRelativePathA("AndreasOnline.cfg");
         const ao::NetworkConfig netCfg = ao::LoadNetworkConfig(cfgPath);
-        ao::log::Info("network config: server=%s:%u name='%s' "
+        ao::log::Info("network config: server=%s:%u name='%s' account='%s' "
                       "(create/edit AndreasOnline.cfg next to this .asi to change)",
-                      netCfg.serverIp.c_str(), netCfg.serverPort, netCfg.playerName.c_str());
-        g_network.Connect(netCfg.serverIp, netCfg.serverPort, netCfg.playerName);
+                      netCfg.serverIp.c_str(), netCfg.serverPort, netCfg.playerName.c_str(),
+                      netCfg.accountUser.empty() ? "(anonymous)" : netCfg.accountUser.c_str());
+        g_network.Connect(netCfg.serverIp, netCfg.serverPort, netCfg.playerName,
+                           netCfg.accountUser, netCfg.accountPassword);
 
         HANDLE hThread = CreateThread(nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
         if (!hThread) {

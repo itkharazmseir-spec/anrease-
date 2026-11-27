@@ -15,6 +15,12 @@ inline constexpr const char* kVersionString = AO_VERSION_STRING;
 // Client and server refuse to talk if this differs (enforced from step 2 on).
 // v3 (2026-11-27): added MessageType::DamageReport + the DamageReport struct
 // (item 5, "weapon/damage sync" - see Protocol.h and docs/MEMORY.md).
-inline constexpr std::uint16_t kProtocolVersion = 3;
+// v4 (2026-11-27, later): added the persistent account system - Handshake
+// gained accountUser/accountPasswordHash, HandshakeAck gained accountId, and
+// HandshakeResult gained AuthFailed (see Protocol.h and docs/MEMORY.md).
+// v5 (2026-11-27, later still): added MessageType::PurchaseDelivery + the
+// PurchaseDelivery/PurchaseItemKind types (item 7, "store/purchase
+// delivery" - see Protocol.h and docs/MEMORY.md).
+inline constexpr std::uint16_t kProtocolVersion = 5;
 
 } // namespace ao

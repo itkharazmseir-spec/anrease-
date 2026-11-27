@@ -46,6 +46,10 @@ NetworkConfig LoadNetworkConfig(const std::string& filePath) {
             }
         } else if (key == "player_name") {
             cfg.playerName = value;
+        } else if (key == "account_user") {
+            cfg.accountUser = value;
+        } else if (key == "account_password") {
+            cfg.accountPassword = value;
         }
     }
     return cfg;

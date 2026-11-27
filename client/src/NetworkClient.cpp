@@ -6,6 +6,7 @@
 #include <enet/enet.h>
 
 #include "Log.h"
+#include "ao/Sha256.h"
 #include "ao/Version.h"
 
 #if defined(_WIN32)
@@ -54,7 +55,8 @@ NetworkClient::~NetworkClient() {
     // clean up before the process exits anyway.
 }
 
-void NetworkClient::Connect(const std::string& host, uint16_t port, const std::string& playerName) {
+void NetworkClient::Connect(const std::string& host, uint16_t port, const std::string& playerName,
+                             const std::string& accountUser, const std::string& accountPassword) {
     if (!m_enetOk) return;
 
     // Remember these so Poll() can retry with the same parameters later -
@@ -65,9 +67,19 @@ void NetworkClient::Connect(const std::string& host, uint16_t port, const std::s
     m_lastHost = host;
     m_lastPort = port;
     m_pendingPlayerName = playerName;
+    m_pendingAccountUser = accountUser;
+    // Hash right here, once, rather than storing the plaintext password at
+    // all beyond this one call's stack - see Sha256.h for why this is only
+    // a starting point (no per-account salt yet), not a finished design.
+    m_pendingAccountPasswordHash = accountUser.empty() ? std::array<uint8_t, 32>{}
+                                                        : Sha256(accountPassword);
     m_autoReconnect = true;
     m_reconnectScheduled = false; // this call *is* the (re)connect attempt
 
+    DoConnect();
+}
+
+void NetworkClient::DoConnect() {
     Disconnect(); // drop any previous attempt/connection first
 
     m_host = reinterpret_cast<_ENetHost*>(enet_host_create(nullptr, 1, kChannelCount, 0, 0));
@@ -77,13 +89,13 @@ void NetworkClient::Connect(const std::string& host, uint16_t port, const std::s
     }
 
     ENetAddress addr{};
-    if (enet_address_set_host(&addr, host.c_str()) != 0) {
-        log::Error("NetworkClient: could not resolve server address '%s'", host.c_str());
+    if (enet_address_set_host(&addr, m_lastHost.c_str()) != 0) {
+        log::Error("NetworkClient: could not resolve server address '%s'", m_lastHost.c_str());
         enet_host_destroy(reinterpret_cast<ENetHost*>(m_host));
         m_host = nullptr;
         return;
     }
-    addr.port = port;
+    addr.port = m_lastPort;
 
     m_peer = reinterpret_cast<_ENetPeer*>(
         enet_host_connect(reinterpret_cast<ENetHost*>(m_host), &addr, kChannelCount, 0));
@@ -94,7 +106,8 @@ void NetworkClient::Connect(const std::string& host, uint16_t port, const std::s
         return;
     }
 
-    log::Info("NetworkClient: connecting to %s:%u as '%s'...", host.c_str(), port, playerName.c_str());
+    log::Info("NetworkClient: connecting to %s:%u as '%s'...",
+              m_lastHost.c_str(), m_lastPort, m_pendingPlayerName.c_str());
 }
 
 void NetworkClient::Disconnect() {
@@ -109,6 +122,7 @@ void NetworkClient::Disconnect() {
     m_connected = false;
     m_handshakeAccepted = false;
     m_localPlayerId = 0;
+    m_localAccountId = 0;
 
     std::lock_guard<std::mutex> lock(m_playersMutex);
     m_baseNames.clear();
@@ -123,6 +137,10 @@ void NetworkClient::HandleConnect() {
     hs.protocolVersion = kProtocolVersion;
     std::memset(hs.playerName, 0, sizeof(hs.playerName));
     std::strncpy(hs.playerName, m_pendingPlayerName.c_str(), proto::kMaxNameLen - 1);
+    std::memset(hs.accountUser, 0, sizeof(hs.accountUser));
+    std::strncpy(hs.accountUser, m_pendingAccountUser.c_str(), proto::kMaxAccountUserLen - 1);
+    std::memcpy(hs.accountPasswordHash, m_pendingAccountPasswordHash.data(),
+                sizeof(hs.accountPasswordHash));
 
     uint8_t buf[1 + sizeof(proto::Handshake)];
     buf[0] = static_cast<uint8_t>(proto::MessageType::Handshake);
@@ -139,6 +157,7 @@ void NetworkClient::HandleDisconnect() {
     m_connected = false;
     m_handshakeAccepted = false;
     m_localPlayerId = 0;
+    m_localAccountId = 0;
     m_peer = nullptr; // the host destroyed the peer object already
 
     {
@@ -175,7 +194,14 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             if (ack.result == proto::HandshakeResult::Accepted) {
                 m_handshakeAccepted = true;
                 m_localPlayerId = ack.assignedPlayerId;
-                log::Info("NetworkClient: handshake accepted, player id = %u", m_localPlayerId);
+                m_localAccountId = ack.accountId;
+                if (m_localAccountId != 0) {
+                    log::Info("NetworkClient: handshake accepted, player id = %u, account id = %u",
+                              m_localPlayerId, m_localAccountId);
+                } else {
+                    log::Info("NetworkClient: handshake accepted, player id = %u (anonymous, no account)",
+                              m_localPlayerId);
+                }
                 {
                     std::lock_guard<std::mutex> lock(m_playersMutex);
                     m_baseNames[m_localPlayerId] = m_pendingPlayerName;
@@ -185,6 +211,7 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                 const char* reason =
                     ack.result == proto::HandshakeResult::ProtocolMismatch ? "protocol mismatch" :
                     ack.result == proto::HandshakeResult::ServerFull       ? "server full" :
+                    ack.result == proto::HandshakeResult::AuthFailed       ? "wrong account username/password" :
                                                                               "unknown";
                 log::Error("NetworkClient: handshake rejected (%s)", reason);
 
@@ -194,9 +221,12 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
                 // HandleDisconnect() schedule a reconnect - retrying forever
                 // against a server that will keep rejecting us the same way.
                 // ProtocolMismatch can never succeed (the binaries don't
-                // match), so stop entirely; ServerFull may free up a slot
-                // later, so keep retrying for that one only.
-                if (ack.result == proto::HandshakeResult::ProtocolMismatch) {
+                // match) and AuthFailed will keep failing with the same
+                // (wrong) password forever too, so stop entirely for both;
+                // ServerFull may free up a slot later, so keep retrying for
+                // that one only.
+                if (ack.result == proto::HandshakeResult::ProtocolMismatch ||
+                    ack.result == proto::HandshakeResult::AuthFailed) {
                     m_autoReconnect = false;
                 }
             }
@@ -257,6 +287,13 @@ void NetworkClient::HandlePacket(const uint8_t* data, size_t len) {
             if (m_damageReportCallback) m_damageReportCallback(report);
             break;
         }
+        case proto::MessageType::PurchaseDelivery: {
+            if (bodyLen != sizeof(proto::PurchaseDelivery)) return;
+            proto::PurchaseDelivery delivery{};
+            std::memcpy(&delivery, body, sizeof(delivery));
+            if (m_purchaseDeliveryCallback) m_purchaseDeliveryCallback(delivery);
+            break;
+        }
         default:
             break;
     }
@@ -268,7 +305,12 @@ void NetworkClient::Poll() {
     if (m_reconnectScheduled && NowMs() >= m_nextReconnectAtMs) {
         m_reconnectScheduled = false;
         log::Info("NetworkClient: retrying connection to %s:%u...", m_lastHost.c_str(), m_lastPort);
-        Connect(m_lastHost, m_lastPort, m_pendingPlayerName);
+        // DoConnect(), NOT Connect() - reuses whatever account credentials
+        // (m_pendingAccountUser/m_pendingAccountPasswordHash) the original
+        // Connect() call already hashed, instead of silently wiping them
+        // (see DoConnect()'s own comment in NetworkClient.h for the bug this
+        // fixes, 2026-11-27).
+        DoConnect();
     }
 
     if (!m_host) return;
@@ -363,6 +405,10 @@ void NetworkClient::SetPlayerLeftCallback(std::function<void(uint32_t)> cb) {
 
 void NetworkClient::SetDamageReportCallback(std::function<void(const proto::DamageReport&)> cb) {
     m_damageReportCallback = std::move(cb);
+}
+
+void NetworkClient::SetPurchaseDeliveryCallback(std::function<void(const proto::PurchaseDelivery&)> cb) {
+    m_purchaseDeliveryCallback = std::move(cb);
 }
 
 void NetworkClient::SendChatMessage(const std::string& text) {

@@ -12,6 +12,7 @@
 // rejection forever, so it's logged once and left alone.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -38,7 +39,15 @@ public:
 
     // Starts an asynchronous connection attempt. Safe to call even if ENet
     // failed to initialise (it will just do nothing). Does not block.
-    void Connect(const std::string& host, uint16_t port, const std::string& playerName);
+    //
+    // accountUser/accountPassword (protocol v4, 2026-11-27): optional - pass
+    // empty strings for the old anonymous behaviour. If accountUser is
+    // non-empty, accountPassword is hashed (SHA-256) right here before the
+    // handshake is sent - see Sha256.h - the plaintext password itself is
+    // never put on the wire.
+    void Connect(const std::string& host, uint16_t port, const std::string& playerName,
+                 const std::string& accountUser = std::string(),
+                 const std::string& accountPassword = std::string());
 
     void Disconnect();
 
@@ -50,6 +59,11 @@ public:
     bool IsConnected() const { return m_connected; }
     bool IsReady() const { return m_connected && m_handshakeAccepted; }
     uint32_t LocalPlayerId() const { return m_localPlayerId; }
+    // 0 if this connection is anonymous (no account given to Connect()) or
+    // the handshake hasn't completed yet - otherwise the PERSISTENT account
+    // id the server assigned, the same every time this account logs in
+    // (protocol v4, 2026-11-27).
+    uint32_t LocalAccountId() const { return m_localAccountId; }
 
     // No-ops (silently) if !IsReady().
     void SendPlayerState(const proto::PlayerState& state);
@@ -93,10 +107,31 @@ public:
     // just ignores a report that doesn't name them.
     void SetDamageReportCallback(std::function<void(const proto::DamageReport&)> cb);
 
+    // Fired (from the polling thread, same as the others) for every
+    // PurchaseDelivery the server sends - protocol v5, 2026-11-27, item 7
+    // ("store/purchase delivery"). Main.cpp checks accountId against
+    // LocalAccountId() itself before acting on it (never trust the server
+    // alone to have addressed it correctly) - see Protocol.h's
+    // PurchaseDelivery struct and docs/MEMORY.md for the full design.
+    void SetPurchaseDeliveryCallback(std::function<void(const proto::PurchaseDelivery&)> cb);
+
 private:
     void HandleConnect();
     void HandleDisconnect();
     void HandlePacket(const uint8_t* data, size_t len);
+
+    // Does the actual ENet host/peer setup using whatever is already in
+    // m_lastHost/m_lastPort/m_pendingPlayerName/m_pendingAccountUser/
+    // m_pendingAccountPasswordHash, WITHOUT touching any of them - shared by
+    // Connect() (which sets those fields fresh right before calling this)
+    // and Poll()'s auto-reconnect path, which must reuse the SAME account
+    // credentials an earlier Connect() call already hashed. Fixes a real bug
+    // (2026-11-27): Poll() used to call the public Connect() again with no
+    // accountUser/accountPassword args, which silently wiped the stored
+    // credentials (accountUser.empty() == true) and reconnected the player
+    // as anonymous every single time the connection dropped and
+    // auto-reconnected - see docs/MEMORY.md.
+    void DoConnect();
 
     _ENetHost* m_host = nullptr;
     _ENetPeer* m_peer = nullptr;
@@ -104,7 +139,10 @@ private:
     bool       m_connected = false;
     bool       m_handshakeAccepted = false;
     uint32_t   m_localPlayerId = 0;
+    uint32_t   m_localAccountId = 0;
     std::string m_pendingPlayerName;
+    std::string m_pendingAccountUser;
+    std::array<uint8_t, 32> m_pendingAccountPasswordHash{};
 
     // Auto-reconnect bookkeeping (see the class comment above).
     bool        m_autoReconnect = false;
@@ -123,6 +161,7 @@ private:
     std::function<void(const proto::PlayerState&)>    m_playerStateCallback;
     std::function<void(uint32_t)>                     m_playerLeftCallback;
     std::function<void(const proto::DamageReport&)>   m_damageReportCallback;
+    std::function<void(const proto::PurchaseDelivery&)> m_purchaseDeliveryCallback;
 };
 
 } // namespace ao
