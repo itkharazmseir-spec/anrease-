@@ -84,3 +84,60 @@ different `server.cfg` present.
   real need, a small wrapper script restarting the process on exit, or the
   equivalent in Task Scheduler ("restart the task if it fails"), is the
   straightforward option.
+
+## 5. Antivirus / SmartScreen flags `AndreasOnline.asi` or `AndreasOnlineServer.exe` (2026-11-27)
+
+**This is expected, not a sign of tampering.** Both binaries do things that
+look, to a heuristic/ML-based antivirus engine, exactly like malware - even
+though the actual code is open in this repo and does none of what it's
+being flagged for:
+
+- `AndreasOnline.asi` is loaded into `gta_sa.exe` by the ASI Loader (DLL
+  injection into another process's address space) and writes directly into
+  that process's memory (`client/src/RemotePeds.*`, `client/src/
+  LocalPlayer.*`) to spawn/move peds and vehicles and give weapons.
+- Both the client and server open raw UDP sockets (ENet) and talk a custom
+  binary protocol.
+- Neither binary is code-signed (a proper code-signing certificate costs
+  money and ties to a registered identity - not set up for this project).
+
+Unsigned + process-injecting + network-opening is the exact fingerprint
+Windows Defender's heuristics (and most antivirus vendors') use for trojans,
+so a false positive here is the *common* outcome for a homebrew tool like
+this, not the exception.
+
+**What to actually check if you're unsure a specific download is clean:**
+1. Prefer building from source yourself (see the root `README.md` - "Build
+   the client" / "Build the server") over downloading a pre-built
+   `AndreasOnline-asi` / `AndreasOnlineServer-exe` artifact from the
+   `Actions` tab. You can read every line of C++ that goes into the binary
+   you just built.
+2. If you do use a GitHub Actions artifact, use one built from a commit you
+   can see in `git log` - the Actions tab shows which commit SHA each run
+   built from; compare it against `git log --oneline` in your own clone.
+3. Check the detection name your antivirus reports (in Windows Security:
+   Protection History). A generic/heuristic name (e.g. containing
+   "Wacatac", "Wacapew", "Fuerboos", or no CVE/known-family name at all) is
+   the pattern for this kind of false positive. A specific, well-known
+   malware family name is the only case actually worth investigating
+   further.
+4. Scan the exact file on <https://www.virustotal.com> - if only a small
+   minority of engines (a handful out of 60+) flag it, and they're the
+   generic-heuristic ones, that corroborates a false positive rather than
+   contradicts it.
+
+**If you're distributing this to other players and want to cut down on
+false positives for them too:**
+- Run `tools/windows-defender-exclusion.ps1` (in this repo) once per
+  machine - it adds this project's folders to the local Defender exclusion
+  list so real-time scanning stops re-flagging rebuilds. It does **not**
+  change anything on anyone else's machine, and does not disable
+  antivirus protection in general, only for these specific folders.
+- For a wider fix, the only durable ones are: buying a code-signing
+  certificate and signing both binaries as part of the build (an ongoing
+  cost, not done here), and/or submitting the built binary to Microsoft for
+  false-positive review at
+  <https://www.microsoft.com/en-us/wdsi/filesubmission> (free, but has to
+  be resubmitted for every new build since the file hash changes each
+  time) - both are judgment calls for the project, not something this repo
+  can do on your behalf automatically.
