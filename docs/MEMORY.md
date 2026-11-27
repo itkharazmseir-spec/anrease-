@@ -822,3 +822,58 @@ way). **Still needs:** the user must rebuild/redeploy the client `.asi` via
 GitHub Actions and re-run the FakePlayer auto-test cycle to confirm phase 3
 (in vehicle) no longer hangs the game - this has NOT been re-tested yet as
 of this writing, only reasoned through and patched.
+
+## 2026-11-27 (later still) - vehicle-spawn deadlock fix confirmed working; new cosmetic fix for ped->vehicle switch "looking like death"
+
+**Deadlock fix confirmed:** the user re-ran the FakePlayer auto-test cycle
+(3 full cycles, 12 phase transitions including 3 separate "IN VEHICLE"
+entries) against the rebuilt client with `AllThreadsSuspendGuard` removed
+from `SpawnVehicle()` (previous section) - **no hang this time, across all
+3 cycles.** This is real evidence the deadlock fix worked.
+
+**New cosmetic complaint:** the user then said the ped->vehicle transition
+"just circles, dies, then comes back alive" (پیاده می‌چرخه، می‌میره، بعد
+زنده میشه) - i.e. entering a vehicle looked exactly like the ped dying
+(ragdoll/death animation) right before the car appeared, because the code
+switched representations via `RetirePed()` (sets `CPed::m_fHealth = 0`,
+same as an actual player disconnect).
+
+**Fix:** added `RemotePedManager::HideOldPed(CPed*)` (`RemotePeds.cpp`/
+`.h`), used ONLY for the ped->vehicle switch inside `OnNetworkUpdate()`
+(not for `MarkDisconnected`, which keeps using plain `RetirePed()` - a
+player leaving the session is a different event and showing them go down
+is reasonable there). `HideOldPed()` does the exact same two field writes
+already proven safe elsewhere in this file - `CPed::GetPosition()` (used
+every `Tick()`) and `CPed::m_fHealth` (used in `RetirePed()` and
+`OnNetworkUpdate()` already) - just combined and reordered: move the ped
+1000 units straight down FIRST, then set health to 0. By the time the
+death/ragdoll animation would play, the ped is already invisible
+underground, so nothing is seen to die, while the game's own per-frame
+corpse-cleanup logic still eventually reclaims the pool slot exactly as
+plain `RetirePed()` would have - no pool-leak trade-off, no new game
+address needed.
+
+**Not fixed (documented, lower priority):** the reverse direction (exiting
+a vehicle) still spawns a brand-new ped via `AddPed_RGL`, which "pops into
+existence" rather than smoothly getting out of the car. This is much less
+visually jarring than the death-flash just fixed (it looks similar to a
+player's very first spawn on join, which real testing already found
+acceptable), and fixing it properly would need a genuinely new
+reverse-engineered function (something like a verified "warp ped into/out
+of vehicle as driver" address - GTA SA's SCM opcodes
+WARP_CHAR_INTO_CAR_AS_DRIVER / the exit equivalent are the natural lead,
+likely wrapped by a plugin-sdk prototype, but no such address has been
+found/verified for this RGL build yet). Left as an open, explicitly
+documented gap rather than guessed at.
+
+**Changed files (this round):** `client/src/RemotePeds.cpp` (new
+`HideOldPed()`, used in place of `RetirePed()` for the ped->vehicle switch
+only), `client/src/RemotePeds.h` (declaration + class-comment update).
+
+**Verification:** mingw sync-check compiles clean for both files
+(`-fsyntax-only`, `__try`/`__except` neutralized the usual way; confirmed
+`CVector` exposes a public `.z` member the same way `Tick()`'s existing
+`CVector(x, y, z)` construction already relies on). **Still needs:** the
+user must rebuild/redeploy via GitHub Actions and re-run the FakePlayer
+auto-test cycle to confirm the vehicle-entry transition no longer looks
+like a death - not yet re-tested as of this writing.

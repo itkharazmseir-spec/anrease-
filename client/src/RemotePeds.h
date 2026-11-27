@@ -25,9 +25,13 @@ struct CVector;
 // floating duplicate ped standing where the driver should be:
 //   - on foot: a CPed is spawned/moved, same as before.
 //   - driving: a CVehicle of the right model is spawned/moved instead. The
-//     old ped (if the player just got in) is retired the same way a
-//     disconnect retires one - health set to 0, forgotten, left to the
-//     game's own cleanup.
+//     old ped (if the player just got in) is hidden via HideOldPed() -
+//     teleported deep underground and THEN killed (2026-11-27 revision:
+//     originally this just set health to 0 like a disconnect does, but
+//     real testing showed that looked exactly like the ped dying in place
+//     every time a remote player got in a car; teleporting away first means
+//     nothing visible happens, while the game's own cleanup still reclaims
+//     the pool slot the same as before).
 //   - switching from driving back to on foot: a fresh CPed is spawned. The
 //     vehicle they were driving is NOT despawned or blown up - it is simply
 //     forgotten and left parked where it was (it was already created with
@@ -180,6 +184,7 @@ private:
     CPed*     SpawnPed(const proto::PlayerState& state);
     CVehicle* SpawnVehicle(const proto::PlayerState& state);
     void      RetirePed(CPed* ped);
+    void      HideOldPed(CPed* ped); // teleport-then-kill, for ped->vehicle switch only - see .cpp
     void      ResetInterpolation(RemoteAvatar& avatar, float x, float y, float z, float heading, unsigned long long nowMs);
 
     std::unordered_map<uint32_t, RemoteAvatar> m_avatars; // playerId -> current avatar

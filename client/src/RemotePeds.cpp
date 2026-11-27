@@ -270,16 +270,50 @@ void RemotePedManager::RetirePed(CPed* ped) {
     }
 }
 
+// 2026-11-27, user feedback after the FakePlayer auto-test cycle: switching
+// a remote player's representation from an on-foot ped to a vehicle used
+// RetirePed() (health = 0) and looked, every single time, exactly like the
+// ped dying - ragdoll/death animation - right before the car appeared
+// ("می‌چرخه می‌میره" - "it circles, it dies"). That is a fair complaint:
+// entering a car is not the same event as a player disconnecting, so it
+// should not look like one.
+//
+// HideOldPed() does the SAME two field writes RetirePed()/Tick() already do
+// elsewhere in this file (CPed::GetPosition() and CPed::m_fHealth - no new
+// game address of any kind), just combined and reordered: move the ped deep
+// underground FIRST, then kill it. By the time the health write triggers
+// the game's own death/ragdoll animation, the ped is already invisible
+// underground, so nothing is seen to die - but the game's own per-frame
+// corpse-cleanup logic still eventually reclaims the pool slot, exactly as
+// it would have under plain RetirePed(). This is strictly an improvement
+// over RetirePed() for this one case (switching to a vehicle); RetirePed()
+// itself is unchanged and still used as-is for an actual disconnect
+// (MarkDisconnected), where showing the avatar going down IS a reasonable
+// way to represent "this player just left".
+void RemotePedManager::HideOldPed(CPed* ped) {
+    if (!ped) return;
+    __try {
+        CVector& pos = ped->GetPosition();
+        pos.z -= 1000.0f;
+        ped->m_fHealth = 0.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Already gone one way or another - nothing more to do.
+    }
+}
+
 void RemotePedManager::OnNetworkUpdate(const proto::PlayerState& state) {
     RemoteAvatar& avatar = m_avatars[state.playerId]; // default-constructed on first sight
     const bool wantsVehicle = state.vehicleModel >= 0;
     const unsigned long long now = NowMs();
 
     if (wantsVehicle) {
-        // Switched (or newly joined) into a vehicle: retire any on-foot ped
-        // first so we never show both at once.
+        // Switched (or newly joined) into a vehicle: hide any on-foot ped
+        // first so we never show both at once. Uses HideOldPed() (teleport
+        // underground, then kill), not RetirePed() - see HideOldPed's own
+        // comment above for why: RetirePed() alone made every vehicle entry
+        // look like the ped dying in place.
         if (avatar.ped) {
-            RetirePed(avatar.ped);
+            HideOldPed(avatar.ped);
             avatar.ped = nullptr;
         }
 
