@@ -193,6 +193,12 @@ struct ConnectedPlayer {
                                                       // just for the log
                                                       // line's "repeated"
                                                       // escalation wording
+    ao::proto::PlayerState lastRejectedState{}; // most recent update that
+                                                 // failed the speed check,
+                                                 // kept to detect "settled
+                                                 // at the new spot" (see
+                                                 // kResyncConvergeDist)
+    bool                  hasLastRejectedState = false;
     uint32_t              lastDamageMs = 0; // enet_time_get() at last
                                              // accepted DamageReport where
                                              // this player was the attacker,
@@ -238,6 +244,24 @@ constexpr float kMaxVehicleSpeedMps = 90.0f;
 // speed check entirely for that one update rather than comparing across a
 // gap wide enough that literally any position would be plausible.
 constexpr uint32_t kSpeedCheckMaxGapMs = 5000;
+// 2026-11-27, found via the first real playtest with the fixed purchase
+// poll above: a LEGITIMATE instantaneous position jump happens routinely
+// in GTA SA (e.g. walking through a door into an interior swaps the
+// player onto a completely different, far-away set of world coordinates).
+// The checks above have no way to tell that apart from an actual
+// speed-hack, so the first update after a real interior transition always
+// gets rejected - but a real speed-hack keeps reporting a NEW position
+// every ~100ms (still moving away), while a one-off legitimate jump
+// reports essentially the SAME new position on the next update or two
+// (the player just stands in the new spot). If two consecutive rejected
+// updates are within this distance of each other, that's "stopped, not
+// still running" - treat it as a resync rather than making the player
+// wait out the full kSpeedCheckMaxGapMs grace window (which, at 18:42 in
+// a real test, took over 5 seconds and spammed ~50 "possible
+// speed/teleport hack" log lines, including a false
+// "consider investigating/banning this player" escalation, for a
+// perfectly innocent building entry).
+constexpr float kResyncConvergeDist = 3.0f;
 
 // Anti-grief (2026-11-27): the only vehicleModel values this server will
 // relay - the documented standard GTA SA vehicle id range (plugin-sdk
@@ -467,17 +491,57 @@ void HandlePlayerState(ENetHost* host, ENetPeer* peer, const uint8_t* data, size
             const float maxDist = maxSpeed * (static_cast<float>(dtMs) / 1000.0f);
 
             if (dist > maxDist) {
-                ++it->second.speedViolationStreak;
-                LogLine("player %u ('%s') moved %.1f units in %u ms (max plausible %.1f) - "
-                        "possible speed/teleport hack, update rejected%s",
-                        id, it->second.name.c_str(), dist, dtMs, maxDist,
-                        (it->second.speedViolationStreak >= 5)
-                            ? " [REPEATED - consider investigating/banning this player]"
-                            : "");
-                return; // not broadcast, lastState/lastStateRecvMs untouched
+                // Before rejecting outright: did the PREVIOUS rejected
+                // update land essentially at this same spot? A real
+                // speed-hack keeps reporting a new, farther position every
+                // ~100ms (it's still moving); a one-off legitimate jump
+                // (e.g. walking into a building's interior) reports the
+                // same new position again on the very next update, because
+                // the player is just standing there now. That distinction
+                // is what kResyncConvergeDist detects - treat a converged
+                // pair as a resync instead of making the player wait out
+                // the full kSpeedCheckMaxGapMs grace window.
+                bool resync = false;
+                if (it->second.hasLastRejectedState) {
+                    const float rdx = state.x - it->second.lastRejectedState.x;
+                    const float rdy = state.y - it->second.lastRejectedState.y;
+                    const float rdz = state.z - it->second.lastRejectedState.z;
+                    const float rdist = std::sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+                    resync = rdist <= kResyncConvergeDist;
+                }
+                it->second.lastRejectedState = state;
+                it->second.hasLastRejectedState = true;
+
+                if (!resync) {
+                    ++it->second.speedViolationStreak;
+                    LogLine("player %u ('%s') moved %.1f units in %u ms (max plausible %.1f) - "
+                            "possible speed/teleport hack, update rejected%s",
+                            id, it->second.name.c_str(), dist, dtMs, maxDist,
+                            (it->second.speedViolationStreak >= 5)
+                                ? " [REPEATED - consider investigating/banning this player]"
+                                : "");
+                    return; // not broadcast, lastState/lastStateRecvMs untouched
+                }
+
+                LogLine("player %u ('%s') settled at a new position %.1f units away "
+                        "after %u rejected update(s) - treating as a legitimate "
+                        "teleport (e.g. entering a building) and resyncing",
+                        id, it->second.name.c_str(), dist, it->second.speedViolationStreak);
+                // fall through: accept this update below like any other.
             }
             it->second.speedViolationStreak = 0;
+            it->second.hasLastRejectedState = false;
+        } else {
+            // dtMs == 0, or the gap was wide enough (> kSpeedCheckMaxGapMs)
+            // that the speed check was skipped entirely and this update is
+            // accepted unconditionally - either way, any pending rejection
+            // streak from before is now moot.
+            it->second.speedViolationStreak = 0;
+            it->second.hasLastRejectedState = false;
         }
+    } else {
+        it->second.speedViolationStreak = 0;
+        it->second.hasLastRejectedState = false;
     }
     it->second.lastStateRecvMs = now;
     it->second.lastState = state;

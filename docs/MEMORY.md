@@ -1468,3 +1468,66 @@ project and verified byte-for-byte identical on their machine. Not yet
 verified with the real game client in a live in-game test (the server
 rebuild and final live retest are left for the user to run, same as
 every other in-game-only verification step in this file).
+
+## 2026-11-27 (same session, after the starvation fix): Anti-cheat false-positive on legitimate teleports (e.g. entering a building)
+
+**Symptom:** during the live retest of the starvation fix above, the
+server logged roughly 50 consecutive "possible speed/teleport hack,
+update rejected" lines for a real player over about 5.6 seconds,
+including a `[REPEATED - consider investigating/banning this player]`
+escalation, for what was almost certainly an entirely legitimate
+movement (the position delta, ~475 units, strongly matches GTA SA's own
+behavior of relocating a player onto a different, far-away set of world
+coordinates when they walk through a door into an interior - something
+the current network protocol has no way to flag, since
+`ao::proto::PlayerState` (`shared/include/ao/Protocol.h`) carries no
+interior/area id).
+
+**Root cause (in the speed/teleport sanity check added earlier the same
+day in `HandlePlayerState`, `server/src/Main.cpp`):** when an update is
+rejected, `lastState`/`lastStateRecvMs` were deliberately left untouched
+("not broadcast, lastState/lastStateRecvMs untouched"). This means every
+subsequent update keeps being compared against the same frozen
+pre-jump position, while the elapsed time (`dtMs`) since that frozen
+baseline keeps growing with each real-world second that passes - and
+since the allowed distance (`maxDist`) scales with `dtMs`, the update
+eventually becomes "plausible" simply because enough real time has
+passed, OR the whole check is skipped entirely once `dtMs` exceeds
+`kSpeedCheckMaxGapMs` (5000ms), at which point literally any position is
+accepted unconditionally. Both paths work, eventually, but take as long
+as 5+ seconds for something that should be instant, and spam a
+misleading "investigate/ban" warning the whole time.
+
+**Fix:** track the most recent *rejected* position (`lastRejectedState`,
+`hasLastRejectedState` on `ConnectedPlayer`) separately from the frozen
+pre-jump baseline. When a new update is also rejected, check whether it
+landed within `kResyncConvergeDist` (3.0 units) of the *previous*
+rejected position. If so, the player has stopped moving after the jump -
+they're standing at the new spot, not still running away - which is
+exactly what a legitimate one-off teleport looks like and exactly what a
+continuous speed-hack does *not* look like (a real speed-hack keeps
+reporting a new, farther position on every single ~100ms tick, so two
+consecutive rejects are never close together). On a converged pair, the
+update is accepted immediately (treated as a resync) instead of waiting
+out the full grace window.
+
+**Verification:** wrote a standalone logic simulation
+(`/tmp/server-test3/anticheat_sim.cpp`) reproducing the exact constants
+and branching logic, fed two scenarios:
+- **Scenario A** (legitimate interior-style jump: one big jump, then the
+  same new position reported again): old logic would have taken ~5
+  seconds; new logic resyncs on the very next packet (~100-200ms),
+  confirmed via simulation output ("[RESYNC] dist=471.3 after 1 rejects -
+  accepted").
+- **Scenario B** (continuous speed-hack: position keeps advancing by 50
+  units every tick, never converging): confirmed the new logic still
+  rejects every single one of 20 consecutive updates (20/20 rejected) -
+  the resync path is never triggered because the positions never
+  converge, so this does not weaken the anti-cheat check against actual
+  sustained speed-hacking.
+
+Applied to `server/src/Main.cpp`, pushed to the user's project, and
+verified byte-for-byte identical on their machine (42487 bytes both
+sides). Not yet verified with a real in-game interior transition (left
+for the user's next live playtest, same as other in-game-only
+verification steps in this file).
