@@ -1,6 +1,8 @@
 # Dedicated server (Windows + Linux), ENet-based.
 add_executable(ao_server
     src/Main.cpp
+    src/ServerConfig.cpp
+    src/ServerConfig.h
 )
 
 target_link_libraries(ao_server PRIVATE ao_shared enet)

@@ -17,6 +17,8 @@ add_library(ao_client SHARED
     include/ao/NetworkClient.h
     src/Overlay.cpp
     include/ao/Overlay.h
+    src/RemotePeds.cpp
+    src/RemotePeds.h
 )
 
 target_include_directories(ao_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
