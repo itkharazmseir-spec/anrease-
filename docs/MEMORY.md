@@ -553,3 +553,92 @@ out of scope for this change; only ped health/armour is synced this way.
 Everything past items 1-5 on the original "what's left" list (multi-
 passenger vehicles, security/auth, interior tracking, and actual
 multiplayer testing) remains open; item 4 is dropped (see above).
+
+---
+
+## 2026-11-27 - crash fix: main-thread suspend guard
+
+**What actually happened:** real, live user testing (the user's own game,
+with the standalone `FakePlayer.exe` network-test tool simulating a second
+player - see below) hit a genuine, **100%-reproducible crash** the moment a
+remote player's first `PlayerState` arrived and `RemotePedManager::SpawnPed`
+called `AddPed_RGL`. The user confirmed via Windows Event Viewer that the
+crash is: `Faulting application name: gta_sa.exe`, `Faulting module name:
+gta_sa.exe` (i.e. the fault is in the game's **own** code, not
+`AndreasOnline.asi`), `Exception code: 0xc0000005` (access violation),
+`Fault offset: 0x001e4e00` - an address distinct from any of this project's
+own verified addresses (`kAddr_AddPed_RGL`, `kAddr_CreateCarForScript_RGL`,
+`kAddr_SetHeading_RGL`, `kAddr_FindPlayerPed_RGL`,
+`CPlaceable::SetOrientation`). This is exactly the risk this project has
+disclosed since 2026-11-26 in `RemotePeds.h`'s class comment ("a genuine
+data race and a crash is possible under some timings - this is a real,
+elevated risk, not a formality") turning out to be real, not theoretical:
+`AddPed_RGL`/`CreateCarForScript_RGL` allocate into and mutate the game's
+own global ped/vehicle pools from this project's background polling
+thread, and the game's own main thread was concurrently touching the same
+structures.
+
+**The fix:** a true "no other thread is touching this right now" guarantee,
+without needing to find any new, RGL-specific, unverified game address at
+all - `client/src/MainThreadGuard.h` (new file), `MainThreadSuspendGuard`:
+an RAII class that calls the standard Win32 `OpenThread(
+THREAD_SUSPEND_RESUME, ...)` + `SuspendThread()` on construction (skipping
+itself if the id is 0/unknown, or equals the calling thread, to avoid
+suspending ourselves) and `ResumeThread()` + `CloseHandle()` on
+destruction. The game's real main thread id is captured exactly once, at
+plugin load time, via `GetCurrentThreadId()` inside the
+`AndreasOnlineClient` constructor in `Main.cpp` (new global
+`g_mainThreadId`) - this relies only on the ASI Loader's standard,
+well-documented, version-independent convention that a plugin's global
+constructor runs synchronously on the game's own main thread while it is
+being loaded during the game's own startup, **not** on any RGL-specific or
+otherwise unverified assumption. It is handed to `RemotePedManager` via a
+new `SetMainThreadId()` setter (wired in `Main.cpp`, before anything that
+could trigger a spawn), and the guard is applied **only** around the
+`AddPed_RGL` call inside `SpawnPed()` and the `CreateCarForScript_RGL` call
+inside `SpawnVehicle()` - the two true pool-mutating, once-per-spawn-event
+operations. `SetHeading_RGL` and the routine per-tick position/heading/
+health/armour field writes in `Tick()`/`OnNetworkUpdate()` are deliberately
+**not** wrapped: those write to an already-valid object's own fields
+(lower severity than pool/list mutation, per the pre-existing risk
+disclosure) and happen far more often (~20x/sec per remote avatar) -
+wrapping those too would mean freezing the game's main thread dozens of
+times a second per remote player, for a much smaller safety benefit than
+the one-time spawn calls.
+
+**Changed files:** `client/src/MainThreadGuard.h` (new),
+`client/src/RemotePeds.h`/`.cpp` (`SetMainThreadId`, `m_mainThreadId`, the
+guard wrapped around the two spawn calls), `client/src/Main.cpp`
+(`g_mainThreadId` captured + wired to `RemotePedManager`).
+
+**Verification:** the new code (`MainThreadGuard.h`, the modified
+`RemotePeds.h`/`.cpp`) compiles clean via the usual mingw sync-check
+against the project's real headers. `Main.cpp`'s own two new lines (the
+`GetCurrentThreadId()` capture and the `SetMainThreadId()` call) were
+syntax-checked in isolation against real `<windows.h>` with the exact same
+pattern, since fully compiling `Main.cpp` itself requires the complete
+plugin-sdk + RenderWare header chain (`plugin.h` pulls in the full game
+class tree, 32-bit structure-offset validation, and RenderWare types this
+sandbox does not have set up) - this is consistent with how `Main.cpp` has
+always been treated in this project (every other change to it was reviewed
+by hand plus a targeted check of the new lines, never a full build, because
+a full build has only ever been possible on the user's own Windows/MSVC
+toolchain). **This is a mitigation based on a real, well-precedented
+low-level technique (suspend-inject-resume, used by instrumentation/
+profiling tools for the same reason), not a mathematically proven fix - it
+has not yet been re-tested in the live game.**
+
+**Known, disclosed residual risk (different in kind from the risk it
+fixes):** if the main thread happens to be suspended mid-way through its
+own call into a Windows CRT/heap lock (e.g. mid-`malloc`/mid-`free`) that
+the wrapped call then also needs (both `AddPed` and `CreateCarForScript`
+allocate), this **deadlocks** (hangs) instead of crashing. The heap lock is
+only held for the brief duration of an actual allocation, so this is rare,
+but it is not zero - genuinely different from, not strictly better than,
+the crash it replaces. Judged an acceptable trade only because a hang is
+at least visible immediately and recoverable via Task Manager, unlike a
+crash that corrupts memory and can surface anywhere. **Next step: the user
+needs to rebuild, redeploy, and re-test (ideally again with
+`FakePlayer.exe`, since that is the only way they can currently test with
+a second player) to confirm in the real game whether the crash is actually
+gone.**

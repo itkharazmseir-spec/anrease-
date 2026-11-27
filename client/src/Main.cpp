@@ -67,6 +67,18 @@
 // it on instead - see RemotePeds.h for the full risk disclosure. Treat this
 // as experimental: save your game before testing, and watch for crashes.
 //
+// --- CRASH FIX (2026-11-27) ----------------------------------------------
+// User testing with FakePlayer.exe (a standalone network-test tool, not part
+// of this project) surfaced the risk disclosed two paragraphs up as a real,
+// 100%-reproducible crash the moment a remote player's first PlayerState
+// arrives: Windows Event Viewer confirmed it as an access violation inside
+// gta_sa.exe itself (not this .asi). RemotePedManager's AddPed/
+// CreateCarForScript calls now briefly suspend the game's own main thread
+// (its id captured right below, in this constructor) for just the duration
+// of each call - see client/src/MainThreadGuard.h for the full design and
+// its own, different, honestly-disclosed residual risk (a rare deadlock
+// instead of a crash).
+//
 // --- DAMAGE SYNC (item 5, 2026-11-27) -----------------------------------
 // Real weapon-fire detection (CPed::GiveWeapon or equivalent) was
 // investigated and could not be completed for this build - see
@@ -103,6 +115,12 @@ ao::LocalPlayer      g_localPlayer;
 ao::NetworkClient    g_network;
 ao::Overlay          g_overlay;
 ao::RemotePedManager g_remotePeds;
+
+// Crash fix (2026-11-27): the game's real main thread id, captured in
+// AndreasOnlineClient's constructor below and handed to g_remotePeds via
+// SetMainThreadId() - see MainThreadGuard.h for why this is safe to capture
+// this way and what it is used for.
+DWORD g_mainThreadId = 0;
 
 constexpr DWORD kPollIntervalMs    = 50;    // local player snapshot refresh rate
 constexpr DWORD kLogIntervalMs     = 5000;  // unchanged from the original design
@@ -178,6 +196,18 @@ DWORD WINAPI PollThreadProc(LPVOID) {
 class AndreasOnlineClient {
 public:
     AndreasOnlineClient() {
+        // Crash fix (2026-11-27, see the RGL BUILD NOTICE above and
+        // MainThreadGuard.h for the full design): this constructor runs
+        // synchronously on the game's real main thread, per the ASI
+        // Loader's standard, well-documented, version-independent
+        // convention (the same fact the top-of-file comment already relies
+        // on) - so GetCurrentThreadId() here is the one, true main-thread
+        // id for the entire rest of the process's life. Captured before
+        // anything else so it is available the moment RemotePedManager is
+        // wired up below, and long before the polling thread (the only
+        // thing that will ever use it) is started.
+        g_mainThreadId = GetCurrentThreadId();
+
         // GetPluginDirRelativePathA returns a pointer to an internal buffer:
         // copy it immediately.
         const std::string logPath = paths::GetPluginDirRelativePathA("AndreasOnline.log");
@@ -248,6 +278,11 @@ public:
         g_network.SetPlayerLeftCallback([](uint32_t playerId) {
             g_remotePeds.MarkDisconnected(playerId);
         });
+
+        // Crash fix (2026-11-27): must be set before the first PlayerState
+        // that could trigger a spawn - g_mainThreadId was already captured
+        // at the very top of this constructor, above, so this is safe here.
+        g_remotePeds.SetMainThreadId(g_mainThreadId);
 
         // Item 5 ("weapon/damage sync", 2026-11-27): RemotePedManager
         // watches each remote avatar ped for a health/armour drop caused by

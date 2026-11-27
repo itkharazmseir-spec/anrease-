@@ -4,6 +4,7 @@
 #include "CPed.h"
 #include "CVehicle.h"
 #include "Log.h"
+#include "MainThreadGuard.h"
 
 #include <utility>
 #include <windows.h>
@@ -148,13 +149,15 @@ void RemotePedManager::ResetInterpolation(RemoteAvatar& avatar, float x, float y
 CPed* RemotePedManager::SpawnPed(const proto::PlayerState& state) {
     CPed* ped = nullptr;
 
-    // See RemotePeds.h for the full risk disclosure: this allocates into and
-    // mutates the game's own global ped pool / world-sector lists from our
-    // background polling thread, with no verified-safe main-thread hook to
-    // do it on instead. The SEH guard turns a crash caused by this race into
-    // "this spawn attempt failed, try again next update" instead of taking
-    // the whole game down - but it cannot eliminate the race itself.
+    // See RemotePeds.h for the full risk disclosure, and MainThreadGuard.h
+    // for the crash-fix design: MainThreadSuspendGuard briefly suspends the
+    // game's real main thread for just this one call, so there is provably
+    // no other thread touching the pool while we insert into it - this is
+    // what actually closes the race a real, confirmed crash exposed (see
+    // MainThreadGuard.h), not just the SEH guard below, which only makes a
+    // crash survivable/attributable rather than preventing it.
     __try {
+        MainThreadSuspendGuard mainThreadGuard(m_mainThreadId);
         ped = AddPed_RGL(PED_TYPE_CIVMALE, ResolveRemotePedModel(state.pedModel),
                          CVector(state.x, state.y, state.z),
                          /*makeWander=*/false);
@@ -178,8 +181,10 @@ CPed* RemotePedManager::SpawnPed(const proto::PlayerState& state) {
 CVehicle* RemotePedManager::SpawnVehicle(const proto::PlayerState& state) {
     CVehicle* veh = nullptr;
 
-    // Same risk as SpawnPed above - see RemotePeds.h.
+    // Same risk and same fix as SpawnPed above - see RemotePeds.h and
+    // MainThreadGuard.h.
     __try {
+        MainThreadSuspendGuard mainThreadGuard(m_mainThreadId);
         veh = CreateCarForScript_RGL(state.vehicleModel,
                                      CVector(state.x, state.y, state.z),
                                      /*doMissionCleanup=*/0);
@@ -406,6 +411,10 @@ void RemotePedManager::Tick() {
 
 void RemotePedManager::SetDamageDetectedCallback(std::function<void(uint32_t, float, float)> cb) {
     m_damageDetectedCallback = std::move(cb);
+}
+
+void RemotePedManager::SetMainThreadId(unsigned long mainThreadId) {
+    m_mainThreadId = mainThreadId;
 }
 
 void RemotePedManager::MarkDisconnected(uint32_t playerId) {

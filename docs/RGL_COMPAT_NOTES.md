@@ -260,3 +260,43 @@ damage the victim should feel. This is treated as a reasonable, even
 arguably more complete, interpretation of "damage sync" rather than a bug;
 see `client/src/RemotePeds.h`'s class comment for the full reasoning. Also,
 only ped health/armour is synced this way - vehicle damage is not.
+
+---
+
+## Item 4 revisited (2026-11-27): the dropped main-thread hook, and why a
+## crash made it matter again
+
+Item 4 above (`Events::gameProcessEvent`/`drawingEvent`/etc.) was dropped
+earlier because patching the wrong `CALL` instruction in an unanalysed RGL
+build is itself a likely crash, and no safe address for any of those four
+hooks was found for this build. The trade-off accepted at the time was: no
+safe "once per frame, on the game's own main thread" place to run game-
+memory-mutating code from, so `AddPed_RGL`/`CreateCarForScript_RGL` run
+from the background polling thread instead, with the risk openly disclosed
+in `RemotePeds.h`'s class comment.
+
+On 2026-11-27, real user testing (with the standalone `FakePlayer.exe`
+network-test tool simulating a second player) turned that disclosed,
+previously-theoretical risk into a confirmed, 100%-reproducible crash -
+Windows Event Viewer showed the fault inside `gta_sa.exe` itself (access
+violation `0xc0000005`, offset `0x001e4e00`), the moment a remote player's
+first `PlayerState` triggered a spawn. See `docs/MEMORY.md`'s "2026-11-27 -
+crash fix" entry for the full evidence and the fix that was actually
+implemented: `MainThreadSuspendGuard`
+(`client/src/MainThreadGuard.h`), which briefly suspends the game's real
+main thread (via standard Win32 `SuspendThread`/`ResumeThread`, its id
+captured once at plugin load time) for just the duration of the
+`AddPed_RGL`/`CreateCarForScript_RGL` call.
+
+This is **not** the same thing as finding the item-4 hook addresses - it
+needs no new, RGL-specific, unverified game address at all, since it only
+uses standard OS thread APIs. It trades the crash for a different,
+honestly-disclosed residual risk (a rare deadlock if the main thread is
+suspended while holding a Windows CRT/heap lock the wrapped call also
+needs) rather than eliminating the race by construction the way a real
+main-thread hook would. If item 4's addresses are ever found for this
+build, running `AddPed_RGL`/`CreateCarForScript_RGL` from inside that hook
+instead would be a strictly better fix (eliminates the race with zero
+residual risk, and removes the brief main-thread freeze this guard causes
+on every spawn) - this guard is the best available fix without it, not a
+replacement for finding it.
