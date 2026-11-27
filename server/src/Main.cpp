@@ -23,18 +23,77 @@
 //     ServerConfig.h), overridable by command-line args
 //   - strips control characters from player names and chat text before
 //     storing/broadcasting them (SanitizeAscii/SanitizeCharBuffer)
+//   - basic anti-cheat/anti-grief validation (2026-11-27), all in
+//     HandlePlayerState/HandleDamageReport below:
+//       * clamps self-reported health/armour into GTA SA's normal 0-100
+//         range before relaying
+//       * rejects a vehicleModel outside the known real vehicle-id range
+//         (kMinVehicleModel/kMaxVehicleModel) - this is as much anti-grief
+//         as anti-cheat, since every OTHER client feeds this value straight
+//         into CreateCarForScript_RGL (see RemotePeds.cpp's 2026-11-27
+//         deadlock writeup) - an invalid id could hang/crash everyone else,
+//         not just the sender
+//       * speed/teleport sanity check on PlayerState, using the SERVER's
+//         own clock for elapsed time (never the client's self-reported
+//         tickMs, which a cheat could fake) - a jump further than
+//         kMaxOnFootSpeedMps/kMaxVehicleSpeedMps permits for the real
+//         elapsed time is rejected (not relayed) and logged
+//       * rate-limits DamageReport the same way as chat (kMinDamageIntervalMs)
+//         so a modified client can't claim an impossibly fast kill rate by
+//         flooding max-clamped hits
+//     None of this is a complete anti-cheat system - see docs/MEMORY.md for
+//     the honest list of what it does NOT cover (health/position are still
+//     fundamentally self-reported by each client, just now bounds-checked;
+//     there is no account/ban system, and repeated violations are only
+//     logged, never auto-kicked, to avoid kicking a legitimate player
+//     during a lag spike)
+//
+//   - persistent accounts (protocol v4, 2026-11-27 - see
+//     shared/include/ao/Protocol.h and server/src/AccountStore.h): a
+//     Handshake may optionally include accountUser + a client-side SHA-256
+//     hash of the password (the plaintext password itself never crosses the
+//     network - see shared/include/ao/Sha256.h). A new username is
+//     auto-registered on first use; an existing one must match its stored
+//     hash or the connection is rejected with HandshakeResult::AuthFailed.
+//     Leaving accountUser empty keeps the connection fully anonymous
+//     (unchanged from before v4) - this is what FakePlayer.exe and other
+//     test tools still do. Honest limitations (see docs/MEMORY.md and
+//     Sha256.h's own comment for the full writeup): no per-account salt yet,
+//     storage is a flat text file (accounts.dat) not a real database, and
+//     this is not yet wired to anything that spends real money - that would
+//     need a website over HTTPS first, not this raw UDP handshake.
+//   - store/purchase delivery (protocol v5, 2026-11-27 - see
+//     shared/include/ao/Protocol.h's PurchaseDelivery struct): polls a
+//     plain text file, purchases.txt (next to this executable, see
+//     PollPurchaseQueue below), every kPurchasePollIntervalMs, and relays
+//     each line to whichever CONNECTED player has the matching accountId.
+//     This file is the entire "interface" a future website/store backend
+//     needs to integrate with - it only ever has to append one line per
+//     purchase, nothing about this server's own process. Honest
+//     limitation: if the target player isn't connected right now, that
+//     purchase is silently dropped (logged, not queued) - there is no
+//     "deliver next time they log in" design yet; see docs/MEMORY.md.
 //
 // What this deliberately does NOT do yet (future steps):
-//   - no world simulation, no vehicle ownership/authority, no anti-cheat
-//     validation of incoming positions
+//   - no world simulation, no vehicle ownership/authority
+//   - no server-side authoritative health (a modified client that ignores
+//     incoming DamageReport locally cannot currently be forced to take
+//     damage - see docs/MEMORY.md)
+//   - no ban list, no per-account salt, no real database (see AccountStore.h)
 #include <enet/enet.h>
+#include <cmath>
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#include "AccountStore.h"
 
 #if defined(_WIN32)
 // enet/win32.h (included via enet/enet.h above, before this point) already
@@ -120,6 +179,28 @@ struct ConnectedPlayer {
     uint32_t              lastPosLogMs = 0; // enet_time_get() at last position
                                              // log line, for throttling (see
                                              // kPosLogIntervalMs)
+    uint32_t              lastStateRecvMs = 0; // enet_time_get() at last
+                                                // ACCEPTED PlayerState - the
+                                                // server's own clock, used
+                                                // for the speed/teleport
+                                                // sanity check (never the
+                                                // client's self-reported
+                                                // tickMs, which a cheat
+                                                // could fake)
+    uint32_t              speedViolationStreak = 0; // consecutive rejected
+                                                      // PlayerState updates
+                                                      // for the speed check,
+                                                      // just for the log
+                                                      // line's "repeated"
+                                                      // escalation wording
+    uint32_t              lastDamageMs = 0; // enet_time_get() at last
+                                             // accepted DamageReport where
+                                             // this player was the attacker,
+                                             // for rate-limiting
+    uint32_t              accountId = 0; // 0 = anonymous connection (no
+                                          // accountUser given at handshake);
+                                          // otherwise the persistent id from
+                                          // AccountStore - see HandleHandshake
 };
 
 constexpr enet_uint8 kChannelReliable   = 0;
@@ -142,10 +223,51 @@ constexpr uint32_t kMinChatIntervalMs = 400;
 // behaviour and is not read back by any client.
 constexpr uint32_t kPosLogIntervalMs = 5000;
 
+// Anti-cheat (2026-11-27): speed/teleport sanity check for PlayerState.
+// These are generous upper bounds on how far a player could plausibly move
+// between two updates, in game units (meters, same scale GTA SA itself
+// uses) per second - picked well above any legitimate movement (sprinting
+// on foot is roughly 7-8 m/s; even fast cars in the base game top out well
+// under 90 m/s) so a normal player, even through a lag spike, should never
+// be falsely flagged - this is meant to catch a blatant teleport/speed-hack,
+// not borderline cases.
+constexpr float kMaxOnFootSpeedMps  = 20.0f;
+constexpr float kMaxVehicleSpeedMps = 90.0f;
+// If more real time than this has passed since the last accepted update,
+// the gap itself explains any distance (lag spike, brief stall) - skip the
+// speed check entirely for that one update rather than comparing across a
+// gap wide enough that literally any position would be plausible.
+constexpr uint32_t kSpeedCheckMaxGapMs = 5000;
+
+// Anti-grief (2026-11-27): the only vehicleModel values this server will
+// relay - the documented standard GTA SA vehicle id range (plugin-sdk
+// eVehicleModel.h: MODEL_LANDSTAL=400 through the last ordinary vehicle
+// slot, 611). Every vehicle a player can legitimately drive falls in this
+// range; this exists purely to reject a garbage model id, which every
+// OTHER client would otherwise feed straight into their own
+// CreateCarForScript_RGL (see client/src/RemotePeds.cpp's 2026-11-27
+// deadlock writeup - that call is not proven safe against an arbitrary
+// invalid model, so a player sending one on purpose could hang or crash
+// everyone else's game, not just their own).
+constexpr int32_t kMinVehicleModel = 400;
+constexpr int32_t kMaxVehicleModel = 611;
+
+// Anti-cheat (2026-11-27): a player may be the ATTACKER in at most one
+// accepted DamageReport per this many milliseconds - well above the fire
+// rate of any real weapon in the base game, so this only catches a client
+// sending reports far faster than any real weapon could, never a
+// legitimate fast-firing weapon.
+constexpr uint32_t kMinDamageIntervalMs = 80;
+
+// Item 7 ("store/purchase delivery", 2026-11-27): how often PollPurchaseQueue
+// re-reads purchases.txt - see that function and the top-of-file comment.
+constexpr uint32_t kPurchasePollIntervalMs = 2000;
+
 uint32_t g_nextPlayerId = 1;
 uint32_t g_maxPlayers   = 32; // overridable via argv[2]; also used as the
                                // ENetHost peerCount
 std::unordered_map<uint32_t, ConnectedPlayer> g_players; // key: playerId
+ao::AccountStore g_accounts; // loaded once in main() from accounts.dat
 
 uint32_t PlayerIdFromPeer(ENetPeer* peer) {
     // We stash the assigned id directly in ENetPeer::data once the
@@ -211,6 +333,44 @@ void HandleHandshake(ENetHost* host, ENetPeer* peer, const uint8_t* data, size_t
         return;
     }
 
+    // Accounts (protocol v4): an empty accountUser means "anonymous" -
+    // unchanged behaviour from before v4, and what FakePlayer.exe and other
+    // test tools still send. A non-empty accountUser must either match an
+    // existing account's stored password hash, or (first time this username
+    // is ever seen) is auto-registered on the spot - there is deliberately no
+    // separate "register" step yet, since this is still a single flat-file
+    // store, not a real account-creation flow behind a website.
+    uint32_t resolvedAccountId = 0;
+    {
+        const std::string accountUser =
+            ClampedName(hs.accountUser, ao::proto::kMaxAccountUserLen);
+        if (!accountUser.empty()) {
+            std::array<uint8_t, 32> providedHash{};
+            std::memcpy(providedHash.data(), hs.accountPasswordHash, ao::proto::kAccountHashLen);
+
+            if (const ao::AccountRecord* existing = g_accounts.Find(accountUser)) {
+                if (existing->passwordHash != providedHash) {
+                    LogLine("rejecting peer: wrong password for account '%s'",
+                             ao::AccountStore::Normalize(accountUser).c_str());
+                    ao::proto::HandshakeAck ack{};
+                    ack.result = ao::proto::HandshakeResult::AuthFailed;
+                    ack.assignedPlayerId = 0;
+                    ack.accountId = 0;
+                    SendMessage(peer, ao::proto::MessageType::HandshakeAck, ack, /*reliable=*/true);
+                    enet_peer_disconnect_later(peer, 0);
+                    return;
+                }
+                resolvedAccountId = existing->accountId;
+            } else {
+                const ao::AccountRecord& created = g_accounts.Create(
+                    accountUser, providedHash, static_cast<uint64_t>(std::time(nullptr)));
+                resolvedAccountId = created.accountId;
+                LogLine("account '%s' auto-registered as accountId %u",
+                         created.username.c_str(), created.accountId);
+            }
+        }
+    }
+
     const uint32_t id = g_nextPlayerId++;
     ConnectedPlayer& player = g_players[id];
     player.id = id;
@@ -221,13 +381,16 @@ void HandleHandshake(ENetHost* host, ENetPeer* peer, const uint8_t* data, size_t
     }
     player.peer = peer;
     player.handshakeDone = true;
+    player.accountId = resolvedAccountId;
     peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
 
-    LogLine("player %u ('%s') connected", id, player.name.c_str());
+    LogLine("player %u ('%s') connected%s", id, player.name.c_str(),
+             resolvedAccountId != 0 ? " (account)" : " (anonymous)");
 
     ao::proto::HandshakeAck ack{};
     ack.result = ao::proto::HandshakeResult::Accepted;
     ack.assignedPlayerId = id;
+    ack.accountId = resolvedAccountId;
     SendMessage(peer, ao::proto::MessageType::HandshakeAck, ack, /*reliable=*/true);
 
     // Tell the new player about everyone already online...
@@ -265,9 +428,60 @@ void HandlePlayerState(ENetHost* host, ENetPeer* peer, const uint8_t* data, size
         (it->second.lastState.tickMs - state.tickMs) < 0x80000000u) {
         return;
     }
+
+    // Anti-cheat: clamp self-reported health/armour into GTA SA's normal
+    // 0-100 range before anything else touches them - a malicious client
+    // could otherwise broadcast e.g. health=99999, which every other
+    // client would write straight into their local copy of this avatar.
+    if (state.health < 0.0f) state.health = 0.0f;
+    if (state.health > 100.0f) state.health = 100.0f;
+    if (state.armour < 0.0f) state.armour = 0.0f;
+    if (state.armour > 100.0f) state.armour = 100.0f;
+
+    // Anti-grief: only relay a vehicleModel this server recognizes as a
+    // real vehicle id (see kMinVehicleModel/kMaxVehicleModel above). -1
+    // (on foot) always passes; anything else out of range is forced back
+    // to on-foot rather than forwarded, since every OTHER client feeds
+    // this value straight into CreateCarForScript_RGL.
+    if (state.vehicleModel != -1 &&
+        (state.vehicleModel < kMinVehicleModel || state.vehicleModel > kMaxVehicleModel)) {
+        LogLine("player %u ('%s') sent out-of-range vehicleModel %d - treating as on-foot",
+                id, it->second.name.c_str(), state.vehicleModel);
+        state.vehicleModel = -1;
+    }
+
+    // Anti-cheat: speed/teleport sanity check, using the SERVER's own
+    // clock for elapsed time - never the client's self-reported tickMs,
+    // which a cheat could simply fake to make an impossible jump look slow.
+    const uint32_t now = enet_time_get();
+    if (it->second.lastStateRecvMs != 0) {
+        const uint32_t dtMs = now - it->second.lastStateRecvMs;
+        if (dtMs > 0 && dtMs <= kSpeedCheckMaxGapMs) {
+            const float dx = state.x - it->second.lastState.x;
+            const float dy = state.y - it->second.lastState.y;
+            const float dz = state.z - it->second.lastState.z;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const bool wasOrIsInVehicle =
+                state.vehicleModel != -1 || it->second.lastState.vehicleModel != -1;
+            const float maxSpeed = wasOrIsInVehicle ? kMaxVehicleSpeedMps : kMaxOnFootSpeedMps;
+            const float maxDist = maxSpeed * (static_cast<float>(dtMs) / 1000.0f);
+
+            if (dist > maxDist) {
+                ++it->second.speedViolationStreak;
+                LogLine("player %u ('%s') moved %.1f units in %u ms (max plausible %.1f) - "
+                        "possible speed/teleport hack, update rejected%s",
+                        id, it->second.name.c_str(), dist, dtMs, maxDist,
+                        (it->second.speedViolationStreak >= 5)
+                            ? " [REPEATED - consider investigating/banning this player]"
+                            : "");
+                return; // not broadcast, lastState/lastStateRecvMs untouched
+            }
+            it->second.speedViolationStreak = 0;
+        }
+    }
+    it->second.lastStateRecvMs = now;
     it->second.lastState = state;
 
-    const uint32_t now = enet_time_get();
     if (it->second.lastPosLogMs == 0 || (now - it->second.lastPosLogMs) >= kPosLogIntervalMs) {
         it->second.lastPosLogMs = now;
         LogLine("player %u ('%s') pos %.3f %.3f %.3f  heading %.3f rad  veh %d",
@@ -285,6 +499,18 @@ void HandleDamageReport(ENetHost* host, ENetPeer* peer, const uint8_t* data, siz
 
     auto it = g_players.find(id);
     if (it == g_players.end()) return;
+
+    // Anti-cheat: rate-limit how often this player can be the ATTACKER in
+    // an accepted DamageReport - same anti-spam style as chat above, just
+    // dropped silently. Without this, a modified client could flood
+    // max-clamped (100 hp) reports far faster than any real weapon fires,
+    // claiming an impossibly fast kill rate even though each individual
+    // report looks like a normal hit.
+    const uint32_t nowForRateLimit = enet_time_get();
+    if (it->second.lastDamageMs != 0 &&
+        (nowForRateLimit - it->second.lastDamageMs) < kMinDamageIntervalMs) {
+        return;
+    }
 
     ao::proto::DamageReport report{};
     std::memcpy(&report, data, sizeof(report));
@@ -304,6 +530,8 @@ void HandleDamageReport(ENetHost* host, ENetPeer* peer, const uint8_t* data, siz
     if (report.healthDelta > 100.0f) report.healthDelta = 100.0f;
     if (report.armourDelta < 0.0f) report.armourDelta = 0.0f;
     if (report.armourDelta > 100.0f) report.armourDelta = 100.0f;
+
+    it->second.lastDamageMs = nowForRateLimit;
 
     LogLine("player %u dealt %.1f hp / %.1f armour damage to player %u",
             report.attackerPlayerId, report.healthDelta, report.armourDelta, report.victimPlayerId);
@@ -353,6 +581,86 @@ void HandleDisconnect(ENetHost* host, ENetPeer* peer) {
     ao::proto::PlayerLeft left{};
     left.playerId = id;
     BroadcastMessage(host, ao::proto::MessageType::PlayerLeft, left, /*reliable=*/true);
+}
+
+// Item 7 ("store/purchase delivery", 2026-11-27) - see the top-of-file
+// comment and docs/MEMORY.md for the full design. Deliberately a drain
+// queue, not a durable store: every poll reads the whole file, tries to
+// deliver each line, then truncates it to empty regardless of whether a
+// delivery actually found a connected recipient - a future website backend
+// is expected to only append a line once it already knows (by some means
+// of its own) that the target player is online.
+void PollPurchaseQueue(ENetHost* host) {
+    std::ifstream in("purchases.txt");
+    if (!in.is_open()) return; // no file yet - perfectly normal, nothing to do
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines.push_back(line);
+    }
+    in.close();
+
+    if (lines.empty()) return;
+
+    for (const std::string& entry : lines) {
+        // Format: accountId|itemKind(0=Vehicle,1=Weapon)|itemId|amount
+        std::istringstream iss(entry);
+        std::string accountIdStr, itemKindStr, itemIdStr, amountStr;
+        if (!std::getline(iss, accountIdStr, '|') ||
+            !std::getline(iss, itemKindStr, '|') ||
+            !std::getline(iss, itemIdStr, '|') ||
+            !std::getline(iss, amountStr, '|')) {
+            LogLine("purchases.txt: skipping malformed line: %s", entry.c_str());
+            continue;
+        }
+
+        uint32_t accountId = 0;
+        int itemKindRaw = -1;
+        int32_t itemId = 0;
+        uint32_t amount = 0;
+        try {
+            accountId = static_cast<uint32_t>(std::stoul(accountIdStr));
+            itemKindRaw = std::stoi(itemKindStr);
+            itemId = static_cast<int32_t>(std::stol(itemIdStr));
+            amount = static_cast<uint32_t>(std::stoul(amountStr));
+        } catch (...) {
+            LogLine("purchases.txt: skipping malformed line: %s", entry.c_str());
+            continue;
+        }
+        if (accountId == 0 || (itemKindRaw != 0 && itemKindRaw != 1)) {
+            LogLine("purchases.txt: skipping invalid line: %s", entry.c_str());
+            continue;
+        }
+
+        bool delivered = false;
+        for (auto& [id, player] : g_players) {
+            if (player.accountId != accountId) continue;
+
+            ao::proto::PurchaseDelivery delivery{};
+            delivery.accountId = accountId;
+            delivery.itemKind = static_cast<ao::proto::PurchaseItemKind>(itemKindRaw);
+            delivery.itemId = itemId;
+            delivery.amount = amount;
+            SendMessage(player.peer, ao::proto::MessageType::PurchaseDelivery, delivery, /*reliable=*/true);
+
+            LogLine("delivered purchase (accountId %u, itemKind %d, itemId %d, amount %u) "
+                     "to player %u ('%s')",
+                     accountId, itemKindRaw, itemId, amount, id, player.name.c_str());
+            delivered = true;
+            break; // one connected session per accountId in the normal case
+        }
+        if (!delivered) {
+            LogLine("purchases.txt: accountId %u is not currently connected - "
+                     "purchase dropped (see known limitation in docs/MEMORY.md)",
+                     accountId);
+        }
+    }
+
+    // Drain the queue now that every line has been attempted, whether or
+    // not it found a recipient - see this function's own comment above.
+    std::ofstream clearQueue("purchases.txt", std::ios::trunc);
 }
 
 void HandlePacket(ENetHost* host, ENetPeer* peer, const ENetPacket* packet) {
@@ -425,6 +733,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Accounts (protocol v4): load (or start fresh, if this file doesn't
+    // exist yet - e.g. first run) accounts.dat next to the executable,
+    // same convention as server.cfg above.
+    g_accounts.Load("accounts.dat");
+    LogLine("loaded %zu persistent account(s) from accounts.dat", g_accounts.Count());
+
 #if defined(_WIN32)
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 #endif
@@ -450,6 +764,7 @@ int main(int argc, char** argv) {
     LogLine("usage: %s [port] [maxPlayers]  (or set port=/max_players= in server.cfg)", argv[0]);
 
     ENetEvent event;
+    uint32_t lastPurchasePollMs = 0;
 #if defined(_WIN32)
     while (!g_shutdownRequested) {
 #else
@@ -472,6 +787,17 @@ int main(int argc, char** argv) {
                 default:
                     break;
             }
+        }
+
+        // Item 7 ("store/purchase delivery") - checked once per loop
+        // iteration (enet_host_service above returns at least every 1000ms
+        // even with no network activity, so this polls roughly every
+        // kPurchasePollIntervalMs regardless of player activity).
+        const uint32_t nowForPurchases = enet_time_get();
+        if (lastPurchasePollMs == 0 ||
+            (nowForPurchases - lastPurchasePollMs) >= kPurchasePollIntervalMs) {
+            lastPurchasePollMs = nowForPurchases;
+            PollPurchaseQueue(host);
         }
     }
 

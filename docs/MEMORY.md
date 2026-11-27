@@ -877,3 +877,456 @@ only), `client/src/RemotePeds.h` (declaration + class-comment update).
 user must rebuild/redeploy via GitHub Actions and re-run the FakePlayer
 auto-test cycle to confirm the vehicle-entry transition no longer looks
 like a death - not yet re-tested as of this writing.
+
+## 2026-11-27 (later still) - basic server-side anti-cheat/anti-grief validation
+
+User asked for anti-cheat so people can't cheat, ahead of a planned public
+release (VPS + public distribution discussion, same session). Implemented
+in `server/src/Main.cpp` only - the server is the one place that can
+actually enforce anything, since the client (and therefore anything inside
+`AndreasOnline.asi`) must be treated as fully exposed/untrustworthy once
+this ships to strangers.
+
+**What was added (all in `HandlePlayerState`/`HandleDamageReport`):**
+1. Health/armour clamp - `PlayerState.health`/`.armour` forced into [0,100]
+   before being relayed, so a client claiming e.g. health=99999 can't make
+   every other client write that straight into its local avatar copy.
+2. VehicleModel whitelist (400-611, the documented standard GTA SA vehicle
+   id range) - anything outside it is forced back to on-foot (-1) rather
+   than relayed. This is as much anti-grief as anti-cheat: every OTHER
+   client feeds this value straight into `CreateCarForScript_RGL`, and the
+   same-day deadlock finding (two sections up) showed that call is not
+   proven safe against an unusual model id - an invalid id sent on purpose
+   could hang/crash everyone else's game, not just the sender's.
+3. Speed/teleport sanity check - distance moved since the last ACCEPTED
+   update is compared against a generous max speed (20 m/s on foot, 90 m/s
+   in a vehicle), using the time elapsed per the SERVER's own clock
+   (`enet_time_get()`), never the client's self-reported `tickMs` (which a
+   cheat could fake to make an impossible jump look slow). A violation is
+   logged and the update is dropped (not relayed, not stored as the new
+   baseline) rather than auto-kicking - repeated violations escalate the
+   log wording ("REPEATED - consider investigating/banning") but still
+   don't auto-ban, to avoid kicking a legitimate player hit by a lag spike
+   before this has had more real-world testing.
+4. DamageReport rate limiting - same anti-spam style already used for chat
+   (`kMinDamageIntervalMs = 80`) - without this, a modified client could
+   flood already-clamped 100hp reports far faster than any real weapon
+   fires, claiming an impossibly fast kill rate even though each individual
+   report looks legitimate.
+
+**Honest limits (also written into the file's own top comment):** this is
+NOT a complete anti-cheat system.
+- Health/position are still fundamentally self-reported by each client -
+  this only bounds-checks and rate-limits them, it does not make the
+  server authoritative. A modified client could still, for example, ignore
+  an incoming `DamageReport` locally and simply never lose health on its
+  own screen - the server has no way to force a client's own game engine
+  to apply damage to itself. Making health server-authoritative would be a
+  much bigger redesign (the server would need to track and enforce health
+  itself rather than relay a client's own claim) and was not attempted.
+- No persistent accounts or ban list - a violation is only logged to the
+  console, there's no mechanism yet to act on a repeat offender beyond an
+  operator reading the log.
+- Speed caps are deliberately generous (chosen well above legitimate
+  movement) specifically to avoid false positives before any real-world
+  multi-player testing has happened - they catch blatant teleport/speed
+  hacks, not subtle ones.
+
+**Verification:** compiled clean natively (`g++ -std=c++23`), linked and
+run live on port 17900, exercised with a new scripted test client
+(`/tmp/server-test3/test_anticheat.cpp`, not part of the shipped project)
+covering all four additions - confirmed via the test client's own decoded
+view of what the server actually relayed back: (1) a normal small move was
+relayed as-is, (2) a 7070-unit jump in 152ms was rejected (not relayed at
+all), (3) `vehicleModel=99999` was relayed as `-1`, (4) `vehicleModel=400`
+was relayed unchanged, (5) 5 damage reports 20ms apart produced only 2
+relayed hits (rate limiter working), (6) `health=99999, armour=-500` was
+relayed as `health=100.0, armour=0.0`.
+
+## Persistent account system (protocol v4, 2026-11-27)
+
+Motivated directly by the "website store, buy a car, it appears in-game at
+your current position" idea the user described - that scheme needs a way
+to tie a purchase made on a website to "whichever live connection is
+currently this specific person", which an anonymous per-connection
+`playerId` (reassigned every reconnect) cannot do. This is step 1 of that
+larger plan: a stable, persistent `accountId` a player keeps across
+reconnects and across server restarts. The website/store/payment pipeline
+itself is NOT built yet - this is only the identity foundation it would
+sit on top of.
+
+**Protocol change (bumped `kProtocolVersion` 3 -> 4,
+`shared/include/ao/Protocol.h`):**
+- `Handshake` gained `accountUser[32]` and `accountPasswordHash[32]` (raw
+  SHA-256 digest bytes - the plaintext password itself never crosses the
+  network; it's hashed client-side before the `Handshake` is ever built -
+  see `NetworkClient.cpp`'s `Connect()`).
+- `HandshakeResult` gained `AuthFailed = 3`.
+- `HandshakeAck` gained `accountId` (0 = anonymous connection, nonzero =
+  the persistent id tied to that username).
+- Leaving `accountUser` empty keeps a connection exactly as anonymous as
+  before v4 - this is what `FakePlayer.exe` and other test tools still do,
+  completely unaffected by any of this.
+
+**New `shared/include/ao/Sha256.h`:** a small, dependency-free SHA-256
+(FIPS 180-4) implementation, since the project has no crypto library
+already linked in on either the client or server side. Verified against
+the official NIST test vectors for `sha256("")` and `sha256("abc")` -
+both matched exactly byte-for-byte before this was used anywhere else.
+**Known, disclosed limitation (written into this file's own comment): no
+per-account salt yet** - every account's hash is a plain, unsalted
+SHA-256 of its password. This is an intentional simplification to get a
+working, testable account system in place first; it should be upgraded
+(salting, and ideally moving the actual login to a website over HTTPS
+instead of this raw UDP handshake) before this is ever used to gate
+anything real-money (the store/purchase idea above).
+
+**New `server/src/AccountStore.h`:** server-side persistence for accounts.
+Storage is a plain, append-mostly text file (`accounts.dat`, next to the
+server executable, same convention as `server.cfg`) - one line per
+account: `accountId|username|sha256HashHex|createdAtUnixSeconds`.
+Usernames are normalized (lowercased, trimmed) so "Amir"/"amir "/"AMIR"
+all refer to the same account; the separate, unvalidated `playerName` in
+`Handshake` is still whatever display name/case the player wants shown
+in-game. Chosen as a flat file over a real database because the server
+had zero DB dependency before this and account volume for a single small
+community server is tiny - explicitly a starting point, not a scalability
+decision; swapping it for a real database later would not need to change
+anything outside this one file.
+
+**Server-side wiring (`server/src/Main.cpp`'s `HandleHandshake`):** empty
+`accountUser` -> anonymous, unchanged from before v4. Non-empty
+`accountUser` that doesn't exist yet -> auto-registered on the spot (there
+is deliberately no separate "create account" step yet - this is still a
+single flat-file store, not a real account-creation flow behind a
+website). Non-empty `accountUser` that already exists -> the provided
+password hash must match exactly, or the connection is rejected with
+`HandshakeResult::AuthFailed` and disconnected (no player slot is ever
+assigned for a failed login). `g_accounts` (the `AccountStore`) is loaded
+once at server startup from `accounts.dat`, same place `server.cfg` is
+loaded.
+
+**Verification:** compiled clean natively (`g++ -std=c++23`), linked and
+run live, exercised with a new scripted test client
+(`/tmp/server-test3/test_accounts.cpp`, not part of the shipped project)
+covering exactly the scenarios that matter for a persistence system:
+(1) a brand-new username ("alice") auto-registers and gets back a nonzero
+`accountId`; (2) disconnecting and reconnecting as the same username with
+the correct password returns the SAME `accountId` (not a second
+registration); (3) reconnecting with the correct username but a WRONG
+password is rejected with `AuthFailed`, `assignedPlayerId == 0`, and
+`accountId == 0`; (4) an anonymous connection (no `accountUser`) still
+works exactly as before v4, with `accountId == 0`. All four passed. Also
+separately verified true cross-process persistence (not just in-memory for
+one run): killed the server, restarted it (log line confirmed
+`loaded 1 persistent account(s) from accounts.dat`), then logged back in
+as "alice" with the correct password and got back the identical
+`accountId` from before the restart.
+
+**Client-side wiring:** `client/src/NetworkConfig.h`/`.cpp` gained
+`account_user=`/`account_password=` as optional keys in `AndreasOnline.cfg`
+(both default to empty, i.e. anonymous, if left out - fully
+backward-compatible with every existing config file). `NetworkClient`'s
+`Connect()` now takes two optional extra parameters (username, plaintext
+password), hashes the password with `Sha256()` immediately, and only ever
+stores/sends the hash - never the plaintext - from that point on.
+`client/src/Main.cpp` passes `netCfg.accountUser`/`netCfg.accountPassword`
+straight through. The learned `accountId` (from `HandshakeAck`) is cached
+on the client as `m_localAccountId`, exposed via `LocalAccountId()`, and
+reset to 0 on every disconnect. Verified via the mingw sync-check harness
+(`/tmp/ao-synccheck/`) - `NetworkClient.cpp` compiles clean against the
+real game headers (stubbed where needed), same as every other client
+change this session.
+
+**Honest limitation disclosed to the user (plaintext password in the
+config file):** `AndreasOnline.cfg`'s `account_password=` line is the one
+and only place the plaintext password exists at all - anyone with
+filesystem access to that PC can read it. This is acceptable for a
+small/private server used by people who trust each other and their own
+machines, but is NOT an acceptable login mechanism once this is ever
+wired to a real website/payment flow - that needs an actual login page
+over HTTPS, not a config file sitting next to a game executable.
+
+**Process note (this session):** partway through this work, a
+`device_stage_files` call (meant only to check the device's current
+`docs/` and `AccountStore.h` state) was made on paths that still had
+unpushed local edits pending - `device_stage_files` copies FROM the
+device INTO the container, so it silently overwrote several in-progress
+local edits (`Protocol.h`, `Version.h`, `NetworkClient.h/.cpp`,
+`NetworkConfig.h/.cpp`, both `Main.cpp` files) with their OLDER on-device
+versions. Caught immediately by grepping for expected new symbols
+(`accountUser`, `kProtocolVersion = 4`, etc.) right after, and fully
+recovered because verified copies of every affected file already existed
+untouched in the `/tmp` build-harness directories
+(`/tmp/ao-synccheck/`, `/tmp/server-test3/`, `/tmp/NetworkConfig.*`) from
+the compile/test steps done just before the mistake - all five
+accidentally-reverted files were restored from those copies, re-diffed
+byte-for-byte against the harness copies to confirm, and only then pushed
+to the device for real. Lesson for next time: never call
+`device_stage_files` on a path that has local edits not yet pushed - it
+has no merge behavior, it just overwrites.
+
+## Weapon give (direct struct write, item 6, 2026-11-27)
+
+The user explicitly asked for the weapon side of the planned store/purchase
+feature to be reverse-engineered too, not just vehicles. This picks up
+where the item-5 investigation (two sections up) left off, using tooling
+(`search_instructions`/`search_byte_patterns`) that was reported loaded on
+the Ghidra bridge in that earlier session but never actually reachable -
+this session, `load_tool_group("analysis")` worked and exposed them for
+real.
+
+**What was found - `CPed::GiveWeapon` is real, identified, and
+unreachable:** `FUN_005e91d0` is called from `CPopulation::AddPed`'s own
+decompilation (`FUN_00612f36`, the same already-verified function behind
+`kAddr_AddPed_RGL`) as `FUN_005e91d0(weaponId, 0x61a9)` - `0x61a9` = 25001,
+an "infinite ammo" sentinel, and the call site is gated on gang-member ped
+creation picking a weapon id (`0x16`=PISTOL, `5`=BASEBALLBAT, `0x19`
+=SHOTGUN, `0x1f`=M4, `0x23`=RLAUNCHER - all real `eWeaponType` values).
+This matches plugin-sdk's own `GiveWeapon(eWeaponType, unsigned int ammo,
+bool)` signature closely enough to be confident this is really it.
+
+But `FUN_005e91d0` itself disassembles to nothing but
+`JMP dword ptr [0x014bba20]` - an indirect jump through a global pointer,
+same CFG-looking pattern flagged (but not resolved) in the item-5
+writeup. This time the jump's true target was resolved **deterministically
+by hand** rather than left as a guess: the pointer at `0x014bba20` leads to
+a small stub at `0x0150d2f0` that pushes three constants, then does
+`PUSHFD; SUB dword ptr [ESP+4], 0x15f80; POPFD; RET` - working through that
+arithmetic by hand (`0xf11650 - 0x15f80 = 0xEFB6D0`) gives the real `RET`
+target as `0x00EFB6D0`, a concrete, decompilable function - not a guess,
+every step is pure arithmetic on the binary's own static byte values.
+
+**Why this is still a dead end, and a worse one than a plain CFG jump:**
+decompiling `0x00EFB6D0` shows a hand-written bytecode interpreter, not
+`GiveWeapon`'s real logic - a spinlock, a 0x100-dword "slot" table keyed by
+two magic markers (`0x4b434f4c` = ASCII "LOCK", `0x23495041` = "API#"
+reversed), and a dispatch loop that decodes opcodes and jumps to the
+decoded target via `(*(code *)(...))()`. This is **code virtualization**
+(the whole function body has been compiled into private bytecode and is
+only ever "run" by this interpreter at call time) - a materially harder
+problem than the CFG-style indirect jumps resolved everywhere else in this
+project (`CreateCarForScript`, `SetHeading`, etc.), because there is no
+real x86 function body for `GiveWeapon` left anywhere in the binary to
+decompile or call - the actual logic exists only as data consumed by this
+interpreter. Devirtualizing it (writing a disassembler for this specific,
+bespoke bytecode) or tracing it with a live debugger attached to the
+running game are the only ways to recover the real logic, and neither is
+proportionate to what this feature actually needs - see the alternative
+below, which was built instead.
+
+**What was built instead - give a weapon via direct struct writes, same
+trust model as `m_fHealth`/`m_fArmour`:** rather than calling the
+protected `GiveWeapon`, `LocalPlayer::GiveWeapon()` (new,
+`client/src/LocalPlayer.h`/`.cpp`) writes directly into the local player's
+own `CPed::m_aWeapons[13]` array - a plugin-sdk-verified **data** layout
+(`VALIDATE_OFFSET(CPed, m_aWeapons, 0x5A0)`, `VALIDATE_SIZE(CWeapon,
+0x1C)` - both from `plugin-sdk/plugin_sa/game_sa/CPed.h`/`CWeapon.h`),
+not a reverse-engineered **code** address - the same trust category
+already used for health/armour since the very first session, extended
+here to weapons. Given a weapon type and an ammo count, it:
+1. Maps the `eWeaponType` to its inventory slot (0-12) via a small, static
+   switch table. **This mapping is NOT reverse-engineered from this
+   binary** - it is GTA San Andreas's own long-public, standard
+   weapon-slot assignment (identical across every copy of the game, since
+   it's game-design data baked into every retail copy's `weapon.dat`, not
+   something that differs between this RGL build and any other), the same
+   category of "public, pre-existing knowledge" as the `eWeaponType` enum
+   values themselves.
+2. Writes `m_eWeaponType`, `m_nState` (`WEAPONSTATE_READY`),
+   `m_nAmmoInClip`, `m_nAmmoTotal`, and resets `m_nTimeForNextShot` on
+   that slot. Deliberately leaves `m_pFxSystem` untouched (disclosed
+   limitation below).
+3. Returns `false` (does nothing) for a type with no real weapon slot
+   (e.g. `WEAPONTYPE_ARMOUR`, a pickup, not a carriable weapon) or if
+   there's currently no local player ped - mirrors `ApplyDamage()`'s
+   already-established `__try`/`__except`-guarded, "fail silently rather
+   than crash" style exactly.
+
+**Test hook (not the final store feature - just proves the mechanism
+works):** the chat input already wired to `g_overlay`/`g_network` in
+`client/src/Main.cpp` now intercepts a local-only `/giveweapon <id>
+[ammo]` command before it would be sent to the server - `<id>` is an
+`eWeaponType` numeric value (hex accepted, e.g. `/giveweapon 0x1E 250` for
+an AK47 with 250 ammo). Nothing about this command is sent over the
+network; it only calls `LocalPlayer::GiveWeapon()` on the typing player's
+own ped and prints success/failure to their own chat log.
+
+**Honest, disclosed limitations:**
+- **No per-weapon clip-size table.** `m_nAmmoInClip` and `m_nAmmoTotal`
+  are both just set to the requested ammo count - functional (the weapon
+  fires and reloads normally) but the displayed clip count can be larger
+  than that weapon's "real" clip size. A correct version would look up
+  each weapon's real clip size from `CWeaponInfo`, which was not
+  attempted this session (and might hit the same virtualization wall -
+  not yet checked).
+- **`m_pFxSystem` is never touched.** If a slot previously held a
+  particle-using weapon (flamethrower/spraycan/extinguisher - slots 7/11)
+  and this overwrites it with a different weapon type, nothing frees that
+  particle system. Not expected to come up for a realistic store weapon
+  list (pistols/rifles/etc. never touch those slots), but disclosed as a
+  real gap rather than silently ignored.
+- **Not yet live-tested in-game** - verified only via the mingw
+  sync-check harness (syntax-clean against stub headers mirroring
+  plugin-sdk's real `CWeapon`/`eWeaponType` layout) and a standalone
+  logic-only test of the `/giveweapon` chat-command parsing (hex and
+  decimal ids, missing-ammo default, malformed input) - not against the
+  real running game yet. Needs the user to actually try
+  `/giveweapon 0x1E 250` in-game and confirm the AK47 shows up and fires
+  normally before this is trusted further (e.g. before wiring it to the
+  store/purchase feature).
+
+**Note (added with item 7 below):** the user chose to move on to the
+store/website-connection step before doing this in-game test. The
+store's `PurchaseDelivery` path (below) calls this exact same
+`LocalPlayer::GiveWeapon()` function, so the in-game test is still
+pending and still matters - it just hasn't blocked progress.
+
+## Store / purchase delivery (item 7, protocol v5, 2026-11-27)
+
+**Goal:** let a future website/store (not built yet - out of scope this
+session) hand a purchased vehicle or weapon to a specific player's
+character in the running game, addressed by their persistent account id
+(the same `accountId` the account system - item 5/v4 - already
+established), without trusting the client to ask for its own items.
+
+**Design, end to end:**
+
+1. **`shared/include/ao/Protocol.h` - new message type and payload.**
+   `MessageType::PurchaseDelivery = 8` (server -> client only, never sent
+   by a client). New `enum class PurchaseItemKind : uint8_t { Vehicle =
+   0, Weapon = 1 };`. New fixed-size struct:
+   ```cpp
+   struct PurchaseDelivery {
+       uint32_t         accountId;
+       PurchaseItemKind itemKind;
+       int32_t          itemId;
+       uint32_t         amount;
+   };
+   ```
+   `itemId` is a vehicle model id or an `eWeaponType` value depending on
+   `itemKind`; `amount` is unused for vehicles and is the ammo count for
+   weapons. `shared/include/ao/Version.h`'s `kProtocolVersion` bumped
+   4 -> 5 for this addition (additive - old v4 clients simply never see
+   this message type; no breaking change to anything already working).
+
+2. **Server side - `purchases.txt` flat-file queue, polled, not pushed
+   by any other component.** Deliberately the simplest possible
+   integration point: a future website backend's ONLY job is to append a
+   line to `purchases.txt` next to the server executable. Format, one
+   purchase per line:
+   ```
+   accountId|itemKind(0=vehicle,1=weapon)|itemId|amount
+   ```
+   Example: `17|1|30|250` = deliver 250 ammo of weapon id 30 (0x1E,
+   AK47) to the account with id 17. `server/src/Main.cpp` adds
+   `PollPurchaseQueue(ENetHost* host)`, called from the main loop every
+   `kPurchasePollIntervalMs = 2000` ms (not every frame - this is a cheap
+   file-existence-check-dominated poll, not latency-critical). For each
+   line: parses with `|` as delimiter inside a `try`/`catch` around
+   `std::stoul`/`std::stoi`/`std::stol` (malformed lines are logged and
+   skipped, never crash the server); validates `accountId != 0` and
+   `itemKindRaw` is 0 or 1; looks up a connected player in `g_players`
+   whose `accountId` matches; if found, sends them a reliable
+   `PurchaseDelivery` packet and logs success; if NOT found (that account
+   isn't currently connected), logs the drop and does nothing further -
+   **the purchase is silently lost, not queued for next login.** After
+   processing every line in the file (delivered or dropped), the whole
+   file is truncated (`std::ofstream("purchases.txt", std::ios::trunc)`)
+   - this is drain-queue semantics, not a durable store: a line is
+   processed at most once, ever.
+
+3. **Client side - re-check, don't just trust, the `accountId`.**
+   `NetworkClient::HandlePacket()` decodes the `PurchaseDelivery` struct
+   and invokes a new callback (`SetPurchaseDeliveryCallback`,
+   mirroring the existing `SetDamageReportCallback` pattern). The
+   callback registered in `client/src/Main.cpp` independently re-checks
+   `delivery.accountId == g_network.LocalAccountId()` (and that it isn't
+   0) before acting on it at all - belt-and-suspenders against any future
+   server bug that might mis-address a delivery; the server is trusted
+   to address correctly, but the client doesn't blindly assume that.
+   Also bails out (logs an error, drops the item) if there's currently no
+   valid local player ped (`!snap.valid` - e.g. still on the loading
+   screen or main menu when the delivery arrives) rather than crashing
+   or silently discarding with no trace.
+   - **Vehicle delivery:** calls new `RemotePedManager::
+     SpawnStandaloneVehicle(int32_t modelId, float x, float y, float z)`
+     (`client/src/RemotePeds.{h,cpp}`), which reuses the SAME
+     already-verified `TryCreateCarForScript_RGL()` helper that remote
+     players' vehicles already use - spawns the car at the local
+     player's current position, NOT tracked as any avatar's vehicle; from
+     that point on it's just an ordinary world vehicle the game's own
+     logic owns.
+   - **Weapon delivery:** calls the exact same `LocalPlayer::GiveWeapon()`
+     added for item 6 above, with `delivery.itemId` cast to `eWeaponType`
+     and `delivery.amount` as the ammo count. This means every limitation
+     disclosed for item 6 (no clip-size table, `m_pFxSystem` untouched,
+     not yet live-tested in-game) applies here too, unchanged.
+
+4. **`NetworkClient` auto-reconnect bug found and fixed as part of this
+   work (unrelated to purchases themselves, but found while touching
+   this file):** `Poll()`'s auto-reconnect path used to call the public
+   `Connect(m_lastHost, m_lastPort, m_pendingPlayerName)` with no account
+   arguments. `Connect()` always recomputes
+   `m_pendingAccountUser`/`m_pendingAccountPasswordHash` from whatever
+   arguments it's given, defaulting to "anonymous" when
+   `accountUser` is empty - so every auto-reconnect after a dropped
+   connection was silently downgrading the player to an anonymous
+   connection, discarding their real account credentials even though
+   nothing else changed. This matters a lot for the store feature: a
+   silently-anonymous reconnect gets a DIFFERENT (or zero) `accountId`,
+   so purchases addressed to their real account would stop being
+   delivered to them after any network hiccup, with no visible error.
+   **Fix:** split `Connect()` into two: the public `Connect(host, port,
+   playerName, accountUser, accountPassword)` now only sets the pending
+   fields (as before) and then calls a new private `DoConnect()`;
+   `DoConnect()` holds the actual ENet host/peer setup and does NOT touch
+   any of the account-credential fields. `Poll()`'s reconnect path now
+   calls `DoConnect()` directly, so it reuses whatever credentials were
+   last set instead of wiping them. Documented via comments at both
+   declaration (`NetworkClient.h`) and definition (`NetworkClient.cpp`).
+
+**Verification performed:**
+- Server side: compiled natively on Linux (`g++ -std=c++23`), linked as
+  `server_purchases`, run live on port 7779. Two purpose-written ENet
+  test clients (`/tmp/server-test3/test_purchase.cpp` and companions)
+  connected with real account credentials, then a `purchases.txt` line
+  was written by hand for each: one `itemKind=0` (vehicle, model 400)
+  and one `itemKind=1` (weapon, id 30/0x1E AK47, amount 250). Both
+  arrived at the correct connected client with the correct `accountId`,
+  `itemKind`, `itemId`, and `amount` fields intact; `purchases.txt` was
+  confirmed empty afterward (drain confirmed). This is a real client +
+  real server over real ENet sockets, the most rigorous test done this
+  session - not just a syntax check.
+- Client side: `RemotePeds.{h,cpp}` and `NetworkClient.{h,cpp}` compiled
+  clean via the mingw sync-check harness. The `Main.cpp`
+  `PurchaseDelivery` callback's logic (account-id matching, vehicle vs.
+  weapon branching, the "no local ped yet" guard) was additionally
+  checked via a standalone mock-based logic test
+  (`/tmp/purchase_lambda_test.cpp`) exercising: a matching-account
+  vehicle delivery, a matching-account weapon delivery, and a
+  non-matching `accountId` (confirmed correctly ignored).
+- **Not yet done:** an actual live game client receiving a real
+  `PurchaseDelivery` packet while playing (same caveat as item 6 - no
+  real running game available in this environment). The server-side
+  mechanism and the client-side code are each independently verified,
+  but the full chain (real website -> file -> running server -> running
+  game client) has not been exercised end to end.
+
+**Honest, disclosed limitations:**
+- **Drop-if-offline, not queue-for-later.** If the target account isn't
+  connected when `purchases.txt` is polled, that line is logged and
+  discarded - there is no "deliver on next login" design yet. A future
+  improvement would be to re-queue undelivered lines instead of
+  truncating them away.
+- **No real website or payment integration exists.** `purchases.txt` is
+  only the integration point a future website/payment backend would
+  write to; nothing in this session built that backend, a storefront UI,
+  or any payment processing - those remain entirely separate, unbuilt
+  future work.
+- **Polling, not push.** A 2-second delay is possible between a line
+  being written and delivery, by design (cheap and simple over
+  low-latency).
+- Inherits every weapon-give limitation from item 6 above (clip-size,
+  `m_pFxSystem`, not yet live-tested in-game) for weapon purchases
+  specifically.
