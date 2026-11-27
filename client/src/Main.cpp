@@ -129,6 +129,18 @@ DWORD WINAPI PollThreadProc(LPVOID) {
     DWORD msSinceLastSend = 0;
     DWORD msSinceOverlaySync = 0;
 
+    // Spawn-position log (2026-11-27): logged exactly ONCE, the first time
+    // this poll loop sees a valid local-player snapshot - i.e. wherever the
+    // game actually put the player this session (a fresh new game, a loaded
+    // save, whatever the user's own routine is - this makes no assumption
+    // about it). This exists purely to make testing with FakePlayer.exe
+    // easier: instead of guessing a hardcoded in-game coordinate (which
+    // could be wrong, or simply not match what "default" means for this
+    // user's own save/testing routine), this one line always has the exact
+    // answer, as soon as the game loads, with no waiting for the periodic
+    // "pos" log below.
+    bool loggedSpawnPos = false;
+
     for (;;) {
         g_localPlayer.Update();
         g_network.Poll();
@@ -142,6 +154,14 @@ DWORD WINAPI PollThreadProc(LPVOID) {
         g_remotePeds.Tick();
 
         const auto& s = g_localPlayer.Snapshot();
+
+        if (s.valid && !loggedSpawnPos) {
+            loggedSpawnPos = true;
+            ao::log::Info("SPAWN pos %.3f %.3f %.3f  heading %.3f rad - use these "
+                          "three numbers (x y z) as FakePlayer.exe's start position "
+                          "to see the fake player appear right where you are now",
+                          s.x, s.y, s.z, s.headingRad);
+        }
 
         if (s.valid && msSinceLastSend >= kNetSendIntervalMs) {
             msSinceLastSend = 0;
