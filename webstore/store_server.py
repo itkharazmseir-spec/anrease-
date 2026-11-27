@@ -318,10 +318,21 @@ def make_handler(accounts: AccountsFile, purchases: PurchaseQueue, sessions: Ses
 def main():
     parser = argparse.ArgumentParser(description="AndreasOnline web store")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--accounts", default=os.path.join(os.getcwd(), "accounts.dat"),
-                         help="Path to the game server's accounts.dat (default: ./accounts.dat)")
-    parser.add_argument("--purchases", default=os.path.join(os.getcwd(), "purchases.txt"),
-                         help="Path to the game server's purchases.txt (default: ./purchases.txt)")
+    # Default to the folder THIS SCRIPT's parent directory (i.e. one level up
+    # from webstore/) rather than the current working directory - this file
+    # is meant to live at <server folder>/webstore/store_server.py, so its
+    # parent is where AndreasOnlineServer.exe actually writes accounts.dat /
+    # purchases.txt. Using cwd instead was a real bug found during testing:
+    # running `python store_server.py` from inside webstore/ made it look for
+    # accounts.dat in webstore/ itself (where it doesn't exist), so every
+    # login silently failed with "wrong username or password" even for a
+    # correct, existing account. --accounts/--purchases can still override
+    # this explicitly if you deploy this somewhere else.
+    server_folder = os.path.dirname(SCRIPT_DIR)
+    parser.add_argument("--accounts", default=os.path.join(server_folder, "accounts.dat"),
+                         help="Path to the game server's accounts.dat (default: ../accounts.dat, i.e. next to AndreasOnlineServer.exe)")
+    parser.add_argument("--purchases", default=os.path.join(server_folder, "purchases.txt"),
+                         help="Path to the game server's purchases.txt (default: ../purchases.txt, i.e. next to AndreasOnlineServer.exe)")
     args = parser.parse_args()
 
     print(f"[webstore] accounts file: {args.accounts}")
